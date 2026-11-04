@@ -76,13 +76,20 @@ FAULTS = ["illegal", "ebreak", "misaligned load", "misaligned store", "load out 
 ROM_BASE, ROM_WORDS = 0x40000, 1 << 16  # 256 KB of code (two sublayers)
 DROM_BASE, DROM_WORDS = 0x20000, 1 << 15  # 128 KB of read-only data (one sublayer)
 RAM_BASE, RAM_WORDS = 0x0, 1 << 13  # 32 KB (two sublayers)
+# (qwendoom) QWENPUTER_MAP=doom: the Doom machine's map (port/doom.ld): 4 MB of RAM, 8 MB of
+# read-only data at 0x0100_0000, the same 256 KB of code at 0x0200_0000, the text buffer above RAM
+MAP = __import__("os").environ.get("QWENPUTER_MAP", "p2")
+if MAP == "doom":
+    ROM_BASE, ROM_WORDS = 0x2000000, 1 << 16
+    DROM_BASE, DROM_WORDS = 0x1000000, 1 << 21
+    RAM_BASE, RAM_WORDS = 0x0, 1 << 20
 DATA_BASE = 0x100  # .data starts here (address 0 stays a null pointer)
 SP_INIT = RAM_BASE + 4 * RAM_WORDS
 N_MAX = 63  # the R refresh comes before the instruction when n == N_MAX
 MISA = 0x40001100  # RV32, I and M
 # (P3) the text buffer, loads only: row i (1..CAP_MAX) holds the i-th token of the latest tool
 # call's text, its UTF-8 bytes NUL-padded to TEXT_ROW, at TEXT_ADDR + TEXT_ROW * i
-TEXT_ADDR, TEXT_ROW, TEXT_ROWS = 0x8000, 16, 128
+TEXT_ADDR, TEXT_ROW, TEXT_ROWS = (0x8000 if MAP != "doom" else 0xC00000), 16, 128
 # the capture counter's thermometer weights are 8 * 2^m: m < 88 keeps them below bf16's max
 # after the emitter's 2^36 fold
 CAP_MAX = 80

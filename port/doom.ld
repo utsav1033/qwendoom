@@ -1,13 +1,13 @@
 /* The Doom machine's address map: Qwenputer's (env/rom.ld) with room for Doom.
    RAM 4 MB at 0 (data / TLS / bss / heap from 0x100, the stack at the top), read-only data in the
-   DROM at 0x0100_0000 (8 MB: .rodata and the game data), code in the ROM at 0x0200_0000 (1 MB).
-   crt0 points tp at __tls_base. */
+   DROM at 0x0100_0000 (8 MB: .rodata and the game data), code in the ROM at 0x0200_0000 (256 KB,
+   as Qwenputer's: a jump names a 16-bit word index). crt0 points tp at __tls_base. */
 ENTRY(_start)
 MEMORY
 {
   RAM (rw) : ORIGIN = 0x100, LENGTH = 0x400000 - 0x100
   DROM (r) : ORIGIN = 0x1000000, LENGTH = 8M
-  ROM (rx) : ORIGIN = 0x2000000, LENGTH = 1M
+  ROM (rx) : ORIGIN = 0x2000000, LENGTH = 256K
 }
 SECTIONS
 {

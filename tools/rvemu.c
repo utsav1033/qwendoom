@@ -6,10 +6,10 @@
 // faults and stops. At each FRAME_MARK byte the screen can be saved as a PPM, read from the
 // machine's memory as the host will read it from the model's state.
 //
-//   rvemu doom.elf [-frames N] [-shot K out.ppm] [-vbuf ADDR -pal ADDR] [-q]
+//   rvemu doom.elf [-frames N] [-shot K out.ppm] [-vbuf ADDR -pal ADDR] [-q] [-stop N]
 //
 // prints the program's output (FRAME_MARK bytes left out), then the instruction count at every
-// frame (-q: only the totals).
+// frame (-q: only the totals). -stop N: after N instructions, the PC, registers and a RAM hash.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +19,7 @@
 #define DROM_BASE 0x1000000u
 #define DROM_SIZE 0x800000u
 #define ROM_BASE 0x2000000u
-#define ROM_SIZE 0x100000u
+#define ROM_SIZE 0x40000u
 #define FRAME_MARK 12
 
 static uint8_t ram[RAM_SIZE], drom[DROM_SIZE], rom[ROM_SIZE];
@@ -82,18 +82,28 @@ int main(int argc, char **argv) {
     const char *out = NULL;
     uint32_t vbuf = 0, pal = 0;
     int quiet = 0;
+    uint64_t stop = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-frames")) frames = atol(argv[++i]);
         else if (!strcmp(argv[i], "-shot")) shot = atol(argv[++i]), out = argv[++i];
         else if (!strcmp(argv[i], "-vbuf")) vbuf = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-pal")) pal = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-q")) quiet = 1;
+        else if (!strcmp(argv[i], "-stop")) stop = strtoull(argv[++i], NULL, 0);
     }
     load_elf(argv[1]);
     x[2] = RAM_SIZE;  // sp: the host sets it at the top of RAM
     long frame = 0;
     uint64_t last = 0;
     for (;;) {
+        if (icount == stop && stop) {
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t i = 0; i < RAM_SIZE; i++) h = (h ^ ram[i]) * 1099511628211ull;
+            printf("\nstop %llu pc %08x ram %016llx x", (unsigned long long)icount, pc, (unsigned long long)h);
+            for (int i = 1; i < 32; i++) printf(" %x", x[i]);
+            printf("\n");
+            return 0;
+        }
         if (pc < ROM_BASE || pc >= ROM_BASE + ROM_SIZE || pc & 3) fault("bad jump", pc);
         uint32_t w;
         memcpy(&w, rom + (pc - ROM_BASE), 4);
