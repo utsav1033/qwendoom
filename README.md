@@ -48,7 +48,7 @@ RAM and 8 MB of read-only data memory, compiles the real Doom for it, and runs i
 
 ---
 
-## How we got here
+## Timeline
 
 ### Nov 2–4: where it started (a different machine)
 
@@ -106,7 +106,7 @@ frame.
 
 ![Speed over the day](docs/img/speed.svg)
 
-The early steps cut memory traffic. The big ones came from one observation: on every token,
+The first steps cut memory traffic. Most of the speedup comes from this: on every token,
 all 4,096 memory heads (one head holds 1 KB of RAM) check the address, and at most one can match.
 
 ![Why almost all of the model can be skipped](docs/img/skip.svg)
