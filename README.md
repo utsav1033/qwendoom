@@ -46,10 +46,6 @@ happens once: after that, nothing outside touches the machine's memory.
 Stock Qwenputer has 32 KB of RAM. Doom needs megabytes. This repo gives the machine 4 MB of
 RAM and 8 MB of read-only data memory, compiles the real Doom for it, and runs it on the model.
 
-**How this differs from Doom on stock Qwenputer with the host serving a disk:** the game data
-lives in the model's state instead of on the host, nothing is paged in or out during the run,
-and it is one continuous run from Doom's first instruction, every token checked.
-
 ---
 
 ## How we got here
@@ -152,29 +148,6 @@ the model's RAM and saves a PNG: it only reads bytes the model has already writt
 **What "inside the model" means here:** the program and its data are written into the model's
 memory once, before the first token, like flashing a chip. After that, every token is the
 model's own greedy prediction from the token before.
-
----
-
-## What's next
-
-A frame takes 1.6M instructions × 1.65 tokens ÷ 3,700 tokens/s ≈ **11–12 minutes**. Four ways
-to cut that:
-
-1. **Fewer instructions per frame.** Profile Doom's hot loops in `rvemu` (probably wall and
-   floor drawing) and tune the compiler flags. Not started.
-2. **Fewer tokens per instruction.** Set by Qwenputer's trace format; changing it means changing
-   the circuit. Hardest.
-3. **More tokens per second.** The stepper went 132 → 3,700 today. Of the ~270 µs left per
-   token, a third is the RISC-V circuit itself, the rest per-layer overhead. Much beyond 2× needs
-   a GPU.
-4. **Frames in parallel.** `rvemu` would save the machine state (RAM, registers, program counter)
-   at the start of each frame. Each machine loads one of those into the model, runs to the next
-   frame with every token checked, and saves the PNG. Then we check that the model's RAM and
-   registers at the end of each segment equal the next segment's starting state. If they all
-   match, it's the same computation as one long run. One Mac: ~5 frames an hour. 100 machines:
-   ~500. Not built yet: the snapshot dump, reading registers out of the model, the segment
-   runner. Each segment starts from an emulator snapshot; the one unbroken run is the one on
-   the Mac.
 
 ---
 
