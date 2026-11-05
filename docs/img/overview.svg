@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <rect width="960" height="560" fill="#ffffff"/>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#57606a"/>
+    </marker>
+  </defs>
+
+  <text x="480" y="38" text-anchor="middle" font-size="22" font-weight="700" fill="#1f2328">How Doom runs inside Qwen</text>
+
+  <!-- 1: Doom source -->
+  <rect x="30" y="80" width="170" height="110" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="115" y="112" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">Doom</text>
+  <text x="115" y="134" text-anchor="middle" font-size="13" fill="#57606a">the real game's C code</text>
+  <text x="115" y="152" text-anchor="middle" font-size="13" fill="#57606a">(doomgeneric)</text>
+  <text x="115" y="172" text-anchor="middle" font-size="13" fill="#57606a">+ a tiny libc, no OS</text>
+
+  <line x1="200" y1="135" x2="262" y2="135" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <text x="231" y="124" text-anchor="middle" font-size="12" fill="#57606a">build</text>
+
+  <!-- 2: RISC-V program -->
+  <rect x="265" y="80" width="170" height="110" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="350" y="112" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">A RISC-V program</text>
+  <text x="350" y="134" text-anchor="middle" font-size="13" fill="#57606a">253 KB of instructions</text>
+  <text x="350" y="152" text-anchor="middle" font-size="13" fill="#57606a">+ 5.5 MB of game data</text>
+  <text x="350" y="172" text-anchor="middle" font-size="13" fill="#57606a">(Freedoom WAD)</text>
+
+  <line x1="435" y1="135" x2="497" y2="135" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <text x="466" y="118" text-anchor="middle" font-size="12" fill="#57606a">load</text><text x="466" y="160" text-anchor="middle" font-size="12" fill="#57606a">once</text>
+
+  <!-- 3: the model -->
+  <rect x="500" y="64" width="430" height="330" rx="12" fill="#eef6ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="715" y="92" text-anchor="middle" font-size="16" font-weight="700" fill="#0550ae">A Qwen3.5 model (328 layers)</text>
+  <text x="715" y="112" text-anchor="middle" font-size="12.5" fill="#0550ae">its weights are a CPU, compiled in (Qwenputer). Nothing is trained.</text>
+
+  <rect x="520" y="126" width="390" height="46" rx="8" fill="#ffffff" stroke="#54aeff"/>
+  <text x="540" y="146" font-size="13.5" font-weight="700" fill="#1f2328">CPU circuit</text>
+  <text x="540" y="163" font-size="12.5" fill="#57606a">decodes each instruction, does the math, 32 registers</text>
+
+  <rect x="520" y="182" width="390" height="46" rx="8" fill="#ffffff" stroke="#54aeff"/>
+  <text x="540" y="202" font-size="13.5" font-weight="700" fill="#1f2328">ROM · 256 KB</text>
+  <text x="540" y="219" font-size="12.5" fill="#57606a">Doom's code</text>
+
+  <rect x="520" y="238" width="390" height="46" rx="8" fill="#ffffff" stroke="#54aeff"/>
+  <text x="540" y="258" font-size="13.5" font-weight="700" fill="#1f2328">Read-only memory · 8 MB</text>
+  <text x="540" y="275" font-size="12.5" fill="#57606a">the game data: maps, textures, sprites</text>
+
+  <rect x="520" y="294" width="390" height="46" rx="8" fill="#fff8c5" stroke="#d4a72c"/>
+  <text x="540" y="314" font-size="13.5" font-weight="700" fill="#1f2328">RAM · 4 MB   (was 32 KB: our mod)</text>
+  <text x="540" y="331" font-size="12.5" fill="#57606a">heap, stack and the 320×200 screen</text>
+
+  <text x="715" y="364" text-anchor="middle" font-size="12.5" fill="#0550ae">ROM, data and RAM live in the layers' memory</text>
+  <text x="715" y="381" text-anchor="middle" font-size="12.5" fill="#0550ae">(their recurrent state), not in the weights</text>
+
+  <!-- tokens loop -->
+  <path d="M 715 394 C 715 440, 600 450, 560 450" fill="none" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <rect x="300" y="428" width="258" height="64" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="429" y="452" text-anchor="middle" font-size="14" font-weight="700" fill="#1f2328">It generates tokens</text>
+  <text x="429" y="472" text-anchor="middle" font-size="12.5" fill="#57606a">each token is a piece of an instruction</text>
+  <text x="429" y="486" text-anchor="middle" font-size="12.5" fill="#57606a">(~1.7 tokens per instruction)</text>
+  <path d="M 558 470 C 760 500, 930 470, 905 400" fill="none" stroke="#57606a" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#a)"/>
+  <text x="790" y="512" text-anchor="middle" font-size="12" fill="#57606a">fed back in: its next input</text>
+
+  <!-- check -->
+  <rect x="30" y="428" width="230" height="64" rx="10" fill="#dafbe1" stroke="#4ac26b"/>
+  <text x="145" y="452" text-anchor="middle" font-size="14" font-weight="700" fill="#1a7f37">Checked, every token</text>
+  <text x="145" y="472" text-anchor="middle" font-size="12.5" fill="#1a7f37">vs. Qwenputer's reference CPU</text>
+  <text x="145" y="486" text-anchor="middle" font-size="12.5" fill="#1a7f37">(the run stops if one differs)</text>
+  <line x1="298" y1="460" x2="262" y2="460" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- screen out -->
+  <rect x="30" y="250" width="230" height="110" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="145" y="280" text-anchor="middle" font-size="14" font-weight="700" fill="#1f2328">The frame</text>
+  <text x="145" y="302" text-anchor="middle" font-size="12.5" fill="#57606a">at each frame, the screen bytes</text>
+  <text x="145" y="318" text-anchor="middle" font-size="12.5" fill="#57606a">are read out of the model's RAM</text>
+  <text x="145" y="334" text-anchor="middle" font-size="12.5" fill="#57606a">and saved as a PNG</text>
+  <line x1="518" y1="317" x2="262" y2="305" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <text x="390" y="300" text-anchor="middle" font-size="12" fill="#57606a">read only, like a monitor</text>
+</svg>
