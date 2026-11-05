@@ -58,6 +58,10 @@ class Stepper:
         lib.st_embed.argtypes = [P, P, P, P, P, I, P]
         lib.st_step.argtypes = [P, I, I]
         lib.st_run.argtypes = [P, P, I, P, I, ctypes.c_long, P]
+        lib.st_nonfinite.argtypes = [P]
+        lib.st_save.argtypes = lib.st_load.argtypes = [P, ctypes.c_char_p]
+        lib.st_state.restype = P
+        lib.st_state.argtypes = [P, I]
         D, F, NK, NV = meta["hidden"], meta["intermediate"], meta["key_heads"], meta["value_heads"]
         self.nl, self.r = meta["layers"], NV // NK
         self.m = lib.st_new(self.nl, D, F, NK, NV, meta["vocab"])
@@ -70,6 +74,8 @@ class Stepper:
         for L in range(self.nl):
             for j, mat in enumerate(MATS):
                 nin, nout = dims[mat]
+                # the stepper keeps the weights as bf16 (they are bf16 in the model)
+                assert not (k[f"{L}.{mat}.vals"].view(np.uint32) & 0xFFFF).any(), (L, mat)
                 lib.st_mat(self.m, L, j, nin, nout, ptr(k[f"{L}.{mat}.colptr"]),
                            ptr(k[f"{L}.{mat}.rows"]), ptr(k[f"{L}.{mat}.vals"]))
             lib.st_layer(self.m, L, ptr(k[f"{L}.conv"]), ptr(k[f"{L}.linear_attn.A_log"]),
@@ -103,6 +109,18 @@ class Stepper:
                 vals = np.ascontiguousarray(np.stack([rows[r] for r in keys]), dtype=np.float32)
                 self.lib.st_state_rows(self.m, L, j * self.r + x, len(keys), keys.ctypes.data,
                                        vals.ctypes.data)
+
+    def save(self, path):
+        assert self.lib.st_save(self.m, str(path).encode()) == 0, path
+
+    def restore(self, path):
+        assert self.lib.st_load(self.m, str(path).encode()) == 0, path
+
+    def state(self, layer):
+        """Layer's recurrent state, (value heads, K, K), a view of the stepper's own."""
+        nv = self.meta["value_heads"]
+        buf = (ctypes.c_float * (nv * 128 * 128)).from_address(self.lib.st_state(self.m, layer))
+        return np.ctypeslib.as_array(buf).reshape(nv, 128, 128)
 
     def start(self):
         """Feed PAD and GO; returns the first generated token."""
@@ -149,6 +167,7 @@ def main():
     print(f"{n} tokens in {dt:.1f}s ({n / dt:.0f} tokens/s)"
           + (", every one equal to the reference" if args.check else ""))
     print("output:", bytes(out)[:200])
+    assert st.lib.st_nonfinite(st.m) == 0, "a non-finite conv input (the zero-tap shortcut is off)"
 
 
 if __name__ == "__main__":
