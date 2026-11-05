@@ -10,7 +10,7 @@ memory again.
 
 ![How Doom runs inside Qwen](docs/img/overview.svg)
 
-**Where it stands (Nov 5, 2026):** the boot is running on a MacBook, ~3.8M tokens in, and every
+**Where it stands (Nov 5, 2026):** the boot is running on a MacBook, ~6.8M tokens in, and every
 token so far is equal to the one Qwenputer's reference CPU (a plain Python emulator of the same
 machine) produces. The run stops at the first difference. The boot is ~63M tokens, at
 ~3,700 tokens/s: the first frame drawn by the model is a few hours away, then one every ~11
@@ -35,7 +35,7 @@ I_Init: Setting up machine state.
 [Qwenputer](https://github.com/divagr18/qwenputer) is a CPU written into the weights of a
 model with Qwen3.5's architecture. It's not Alibaba's trained Qwen: nothing is trained. A
 compiler sets every weight so that each token the model generates is a step of a RISC-V
-processor (about 1.7 tokens per instruction). Its memory is the recurrent state of the model's
+processor (about 1.65 tokens per instruction). Its memory is the recurrent state of the model's
 linear-attention layers (Gated DeltaNet): the running memory each layer carries from token to
 token.
 
@@ -92,6 +92,11 @@ original 32 KB machine still builds and passes its tests.
 *Frame 300 of the demo. Left: Doom built for the Mac. Right: the RISC-V build the model runs,
 **in the emulator, not the model**. This is what the model's first frames should look like.*
 
+> **`rvemu`** is a normal C program that acts as the same RISC-V machine, without the model.
+> It plays the whole demo in 21 seconds; the model would take about two months. It says nothing
+> about the model. We use it to test the Doom build, to measure it, and to save the machine's
+> exact memory at any point in the game.
+
 ### Nov 5, 1:30 pm: Doom boots on the model
 
 Written out as ordinary dense weights, the 328 layers would be tens of billions of numbers. We
@@ -115,6 +120,16 @@ float rounding, so a skipped head's output is what the full computation gives. T
 prunes the output layer: of 230,336 possible next tokens, it scores only the few blocks of them
 that could win. Per token, about 250 of 328 layers are skipped whole.
 
+Three things we measured:
+
+- **4 threads gave 2% at first.** Each token read most of the weights from memory, and the
+  4 cores share one memory bus. Reading less (16-bit weights, only the conv taps in use) helped;
+  skipping work helped most.
+- **Doom's demo touches 3.19 MB of the RAM and 4.07 MB of the data memory** (`rvemu -touch`).
+  71 of the 328 layers are never used. Removing them would give ~1.25×. Per-token skipping
+  gives more, since each token touches one address.
+- **A frame is ~1.6M instructions × ~1.65 tokens ≈ 2.5M tokens.**
+
 ### Nov 5, 6:36 pm: the long run starts
 
 `model/run.py` runs the boot on the model and checks every token. It saves a checkpoint every
@@ -137,6 +152,29 @@ the model's RAM and saves a PNG: it only reads bytes the model has already writt
 **What "inside the model" means here:** the program and its data are written into the model's
 memory once, before the first token, like flashing a chip. After that, every token is the
 model's own greedy prediction from the token before.
+
+---
+
+## What's next
+
+A frame takes 1.6M instructions × 1.65 tokens ÷ 3,700 tokens/s ≈ **11–12 minutes**. Four ways
+to cut that:
+
+1. **Fewer instructions per frame.** Profile Doom's hot loops in `rvemu` (probably wall and
+   floor drawing) and tune the compiler flags. Not started.
+2. **Fewer tokens per instruction.** Set by Qwenputer's trace format; changing it means changing
+   the circuit. Hardest.
+3. **More tokens per second.** The stepper went 132 → 3,700 today. Of the ~270 µs left per
+   token, a third is the RISC-V circuit itself, the rest per-layer overhead. Much beyond 2× needs
+   a GPU.
+4. **Frames in parallel.** `rvemu` would save the machine state (RAM, registers, program counter)
+   at the start of each frame. Each machine loads one of those into the model, runs to the next
+   frame with every token checked, and saves the PNG. Then we check that the model's RAM and
+   registers at the end of each segment equal the next segment's starting state. If they all
+   match, it's the same computation as one long run. One Mac: ~5 frames an hour. 100 machines:
+   ~500. Not built yet: the snapshot dump, reading registers out of the model, the segment
+   runner. Each segment starts from an emulator snapshot; the one unbroken run is the one on
+   the Mac.
 
 ---
 

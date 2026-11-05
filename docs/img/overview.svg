@@ -57,7 +57,7 @@
   <rect x="300" y="428" width="258" height="64" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
   <text x="429" y="452" text-anchor="middle" font-size="14" font-weight="700" fill="#1f2328">It generates tokens</text>
   <text x="429" y="472" text-anchor="middle" font-size="12.5" fill="#57606a">each token is a piece of an instruction</text>
-  <text x="429" y="486" text-anchor="middle" font-size="12.5" fill="#57606a">(~1.7 tokens per instruction)</text>
+  <text x="429" y="486" text-anchor="middle" font-size="12.5" fill="#57606a">(~1.65 tokens per instruction)</text>
   <path d="M 558 470 C 760 500, 930 470, 905 400" fill="none" stroke="#57606a" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#a)"/>
   <text x="790" y="512" text-anchor="middle" font-size="12" fill="#57606a">fed back in: its next input</text>
 
