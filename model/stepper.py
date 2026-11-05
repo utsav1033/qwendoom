@@ -61,6 +61,8 @@ class Stepper:
         D, F, NK, NV = meta["hidden"], meta["intermediate"], meta["key_heads"], meta["value_heads"]
         self.nl, self.r = meta["layers"], NV // NK
         self.m = lib.st_new(self.nl, D, F, NK, NV, meta["vocab"])
+        lib.st_ballast.argtypes = [P, I]
+        lib.st_ballast(self.m, meta["ballast_dims"])  # the layout's ballast dims lead (off = 0)
         C = 2 * NK * 128 + NV * 128
         dims = {MATS[0]: (D, C), MATS[1]: (D, NV * 128), MATS[2]: (D, NV), MATS[3]: (D, NV),
                 MATS[4]: (NV * 128, D), MATS[5]: (D, F), MATS[6]: (D, F), MATS[7]: (F, D)}

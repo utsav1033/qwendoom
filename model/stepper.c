@@ -32,6 +32,7 @@ static inline float bf(float x) {  // round to bf16, nearest even (torch's .to(b
     return x;
 }
 static inline float silu(float x) { return x / (1.0f + expf(-x)); }
+
 static inline float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 static inline float softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
@@ -41,6 +42,16 @@ typedef struct {  // a weight matrix by input: input j's outputs rows[colptr[j].
     const float *vals;
     int nlive;
     int32_t *live;  // the outputs any weight reaches, ascending
+    // each input's outputs as runs of consecutive rows (rows ascend within a column, so a run's
+    // weights are consecutive too): run k of input j is rrow[k], rpos[k], rlen[k] for
+    // k in rptr[j]..rptr[j+1]; the live outputs as runs too
+    int32_t *rptr, *rrow, *rpos, *rlen;
+    int nlr;
+    int32_t *lrow, *llen;
+    // the ballast inputs (the first nb dims: they come first in every sum, and never change):
+    // each live output's partial sum over them, made for the ballast values bx
+    int nb, base_ok;
+    float bx[16], *base;
 } Mat;
 
 enum { QKV, Z, B, A, O, GATE, UP, DOWN, NMAT };
@@ -49,14 +60,15 @@ typedef struct {
     Mat m[NMAT];
     const float *conv, *A_log, *dt_bias, *gnorm, *in_norm, *post_norm;
     float *S;   // (NV, K, K) recurrent state, fp32: S[v][key][value]
-    float *cs;  // (QKV channels, CONV - 1) conv state, bf16 values
+    float *cs;  // conv state, bf16 values: (CONV - 1) planes of the QKV channels, oldest first
+    float *cw;  // conv weights: CONV planes of the QKV channels, tap 0 (oldest) first
     float *qkv, *z, *bb, *aa, *cv, *y, *o, *g, *u, *mm, *dn;  // stay 0 outside live outputs
     char *act;  // value heads whose output was nonzero last token
     int decays; // some value head can decay
 } Layer;
 
 typedef struct {
-    int nl, D, F, NK, NV, vocab;
+    int nl, D, F, NK, NV, vocab, nballast;
     Layer *L;
     const float *norm;
     const int32_t *erow, *ecol;  // embedding, CSR by token
@@ -88,18 +100,79 @@ static void mat_init(Mat *m, int nin, int nout, const int32_t *cp, const int32_t
     for (int r = 0, n = 0; r < nout; r++)
         if (seen[r]) m->live[n++] = r;
     free(seen);
+    int nr = 0;
+    m->rptr = malloc(sizeof(int32_t) * (nin + 1));
+    m->rrow = malloc(sizeof(int32_t) * (cp[nin] + 1));
+    m->rpos = malloc(sizeof(int32_t) * (cp[nin] + 1));
+    m->rlen = malloc(sizeof(int32_t) * (cp[nin] + 1));
+    for (int j = 0; j < nin; j++) {
+        m->rptr[j] = nr;
+        for (int p = cp[j]; p < cp[j + 1]; p++) {
+            if (p > cp[j] && rows[p] == rows[p - 1] + 1) m->rlen[nr - 1]++;
+            else m->rrow[nr] = rows[p], m->rpos[nr] = p, m->rlen[nr] = 1, nr++;
+        }
+    }
+    m->rptr[nin] = nr;
+    m->lrow = malloc(sizeof(int32_t) * (m->nlive + 1));
+    m->llen = malloc(sizeof(int32_t) * (m->nlive + 1));
+    m->nlr = 0;
+    for (int r = 0; r < m->nlive; r++) {
+        if (r && m->live[r] == m->live[r - 1] + 1) m->llen[m->nlr - 1]++;
+        else m->lrow[m->nlr] = m->live[r], m->llen[m->nlr] = 1, m->nlr++;
+    }
 }
 
-// y = bf16(W x) on W's live outputs; x has nx nonzero entries at xi
-static void matvec(Model *M, const Mat *m, const float *x, const int32_t *xi, int nx, float *y) {
-    float *acc = M->acc;
-    for (int r = 0; r < m->nlive; r++) acc[m->live[r]] = 0.0f;
-    for (int t = 0; t < nx; t++) {
-        int j = xi[t];
-        float xv = x[j];
-        for (int p = m->colptr[j]; p < m->colptr[j + 1]; p++) acc[m->rows[p]] += m->vals[p] * xv;
+// acc += W[:, j] * xv, run by run: each output still gets its terms in input order
+static inline void addcol(const Mat *m, int j, float xv, float *acc) {
+    for (int k = m->rptr[j]; k < m->rptr[j + 1]; k++) {
+        float *a = acc + m->rrow[k];
+        const float *v = m->vals + m->rpos[k];
+        for (int i = 0, n = m->rlen[k]; i < n; i++) a[i] += v[i] * xv;
     }
-    for (int r = 0; r < m->nlive; r++) y[m->live[r]] = bf(acc[m->live[r]]);
+}
+static inline void live_fill(const Mat *m, float *acc, const float *from) {
+    for (int k = 0, o = 0; k < m->nlr; k++) {
+        float *a = acc + m->lrow[k];
+        int n = m->llen[k];
+        if (from) memcpy(a, from + o, sizeof(float) * n); else memset(a, 0, sizeof(float) * n);
+        o += n;
+    }
+}
+
+// y = bf16(W x) on W's live outputs; x has nx nonzero entries at xi (ascending). The sums over
+// the ballast inputs, which lead every sum, are kept from the last token with the same values.
+static void matvec(Model *M, const Mat *m_, const float *x, const int32_t *xi, int nx, float *y) {
+    Mat *m = (Mat *)m_;
+    float *acc = M->acc;
+    int t0 = 0, nb = m->nb;
+    if (nb && m->nin == M->D) {
+        int same = m->base_ok;
+        for (int i = 0; i < nb && same; i++) same = x[i] == m->bx[i] && (nx > i && xi[i] == i);
+        if (!same) {  // make the partial sums over the ballast inputs
+            live_fill(m, acc, NULL);
+            for (int j = 0; j < nb; j++) {
+                float xv = (nx > j && xi[j] == j) ? x[j] : 0.0f;
+                m->bx[j] = xv;
+                if (xv != 0.0f) addcol(m, j, xv, acc);
+            }
+            if (!m->base) m->base = malloc(sizeof(float) * (m->nlive + 1));
+            for (int r = 0; r < m->nlive; r++) m->base[r] = acc[m->live[r]];
+            m->base_ok = 1;
+        }
+        int all = 1;  // the ballast inputs present: start from their sums, past them in xi
+        for (int i = 0; i < nb; i++) all &= nx > i && xi[i] == i;
+        if (all) {
+            live_fill(m, acc, m->base);
+            t0 = nb;
+        } else {
+            live_fill(m, acc, NULL);
+        }
+    } else {
+        live_fill(m, acc, NULL);
+    }
+    for (int t = t0; t < nx; t++) addcol(m, xi[t], x[xi[t]], acc);
+    for (int k = 0; k < m->nlr; k++)
+        for (int i = m->lrow[k], e = i + m->llen[k]; i < e; i++) y[i] = bf(acc[i]);
 }
 
 static inline void hz_set(Model *M, int i, float v) {
@@ -144,7 +217,11 @@ Model *st_new(int nl, int D, int F, int NK, int NV, int vocab) {
 void st_mat(Model *M, int layer, int which, int nin, int nout, const int32_t *cp,
             const int32_t *rows, const float *vals) {
     mat_init(&M->L[layer].m[which], nin, nout, cp, rows, vals);
+    M->L[layer].m[which].nb = M->nballast;
 }
+
+// the ballast dims are 0..n-1 (model/pack.py's layout: they lead the residual)
+void st_ballast(Model *M, int n) { M->nballast = n < 16 ? n : 0; }
 
 void st_layer(Model *M, int layer, const float *conv, const float *A_log, const float *dt_bias,
               const float *gnorm, const float *in_norm, const float *post_norm) {
@@ -154,6 +231,9 @@ void st_layer(Model *M, int layer, const float *conv, const float *A_log, const 
     L->in_norm = in_norm, L->post_norm = post_norm;
     L->S = calloc((size_t)NV * K * K, sizeof(float));
     L->cs = calloc((size_t)C * (CONV - 1), sizeof(float));
+    L->cw = malloc(sizeof(float) * (size_t)C * CONV);
+    for (int c = 0; c < C; c++)
+        for (int k = 0; k < CONV; k++) L->cw[(size_t)k * C + c] = conv[c * CONV + k];
     L->qkv = calloc(C, sizeof(float)), L->cv = calloc(C, sizeof(float));
     L->z = calloc(NV * K, sizeof(float)), L->y = calloc(NV * K, sizeof(float));
     L->bb = calloc(NV, sizeof(float)), L->aa = calloc(NV, sizeof(float));
@@ -278,13 +358,26 @@ int st_step(Model *M, int tok, int head) {
         matvec(M, &L->m[Z], x, xi, nx, z);
         matvec(M, &L->m[B], x, xi, nx, bb);
         matvec(M, &L->m[A], x, xi, nx, aa);
-        for (int t = 0; t < L->m[QKV].nlive; t++) {  // causal_conv1d_update, silu, in bf16
-            int c = L->m[QKV].live[t];
-            float *s = L->cs + c * (CONV - 1);
-            const float *w = L->conv + c * CONV;
-            float acc = s[0] * w[0] + s[1] * w[1] + s[2] * w[2] + qkv[c] * w[3];
-            cv[c] = bf(silu(bf(acc)));
-            s[0] = s[1], s[1] = s[2], s[2] = qkv[c];
+        {  // causal_conv1d_update, silu, in bf16: run by run over the live channels
+            const Mat *mq = &L->m[QKV];
+            int C = 2 * NK * K + NV * K;
+            float *s0 = L->cs, *s1 = L->cs + C, *s2 = L->cs + 2 * C;
+            const float *w0 = L->cw, *w1 = L->cw + C, *w2 = L->cw + 2 * C, *w3 = L->cw + 3 * C;
+            float tmp[4096];
+            for (int k = 0; k < mq->nlr; k++)
+                for (int c0 = mq->lrow[k], e = c0 + mq->llen[k]; c0 < e; c0 += 4096) {
+                    int n = e - c0 < 4096 ? e - c0 : 4096;
+                    for (int i = 0; i < n; i++) {
+                        int c = c0 + i;
+                        tmp[i] = bf(s0[c] * w0[c] + s1[c] * w1[c] + s2[c] * w2[c] + qkv[c] * w3[c]);
+                    }
+                    // below -89, expf(-x) overflows to inf and x / inf is -0.0 (the same bits the
+                    // full expression gives): nearly every unmatched address row skips expf
+                    for (int i = 0; i < n; i++) cv[c0 + i] = tmp[i] < -89.0f ? -0.0f : bf(silu(tmp[i]));
+                    memcpy(s0 + c0, s1 + c0, sizeof(float) * n);
+                    memcpy(s1 + c0, s2 + c0, sizeof(float) * n);
+                    memcpy(s2 + c0, qkv + c0, sizeof(float) * n);
+                }
         }
         // per key head: the l2-normed key and query (shared by its r value heads)
         int32_t *yi = M->hi;  // (free here: rmsnorm's list is used up)
