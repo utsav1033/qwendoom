@@ -16,7 +16,7 @@ is read out of the model's own memory.*
 ![Frame 39: the model next to rvemu, 0 pixels different](docs/img/model-vs-rvemu.png)
 
 **Where it stands (Nov 5, 2026):** one continuous run on a MacBook, from Doom's first
-instruction. The model booted Doom (69M tokens, 39M instructions) and drew its first 40 frames,
+instruction. The model booted Doom (63M tokens, 36.4M instructions) and drew its first 40 frames,
 every token equal to the one Qwenputer's reference CPU (a plain Python emulator of the same
 machine) produces, and every frame **0 pixels different** from the emulator's. The run stops at
 the first difference. It keeps going at ~3,700 tokens/s, about 12 minutes per gameplay frame.
@@ -143,7 +143,7 @@ saves a checkpoint every 15 minutes and can resume. At each frame, it reads the 
 palette straight out of the model's RAM, checks them against the reference CPU's RAM, and saves
 a PNG: it only reads bytes the model has already written.
 
-The boot took 4.5 hours (69M tokens). Then the first 40 frames came in 20 minutes: the melt
+The boot took 4 h 28 min (63.05M tokens, 36.37M instructions). Then the first 40 frames came in 20 minutes: the melt
 frames are cheap, since Doom only slides columns of the old screen down. Frame 39 is the first
 clean frame of the level.
 
