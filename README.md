@@ -32,7 +32,7 @@ M_LoadDefaults: Load system defaults.
 ```
 
 No frame yet. The boot is ~63M tokens and a gameplay frame ~2.5M, run on a MacBook CPU (M4) at
-~800 tokens/s: a frame every ~50 minutes, the first one about a day in.
+~3,700 tokens/s: the first frame about 5 hours in, then one every ~11 minutes.
 
 ## The memory mod
 
@@ -63,13 +63,16 @@ token for token against the reference machine.
 | ballast sums cached, `silu(x < -89) = -0` | 132 |
 | 4 threads per layer, each product reads only its inputs, bf16 weights, conv reads only its taps | 265 |
 | skip address rows that provably can't match | 797 |
+| skip whole dead layers; the output head by bounded token blocks | 1,960 |
+| one vocabulary-wide best for the head; groups of blocks; zero dims left out | 3,700 |
 
 The last step is where the time was. On every token, every memory layer compares the address
 against all of its rows, and all but one row lose. The stepper proves this before computing:
 for each attention head's 128 query (or key) channels it bounds the largest pre-activation from
 the inputs, with the bias column folded into the address-bit columns so the bound is the exact
 maximum over the rows, plus a bound on float rounding. A head whose bound is below -100 outputs
-exactly -0 after the SiLU, so it is skipped. Values are computed only for a head that can write,
+exactly -0 after the SiLU, so it is skipped. A layer where no head can read or write is skipped whole, and the output head bounds
+blocks of the vocabulary the same way and scores only the ones that could win. Values are computed only for a head that can write,
 from the last 3 tokens' inputs (kept, and checkpointed). Per token, 93 of 5,248 query heads are
 left to compute.
 

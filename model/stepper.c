@@ -139,7 +139,8 @@ typedef struct {
     int32_t *tptr, *tc;    // and per token, its entries (code dim, value), in the code dims' order
     float *tv;
     float *hlo[NT], *hhi[NT];  // per vocabulary range, per block of HB tokens, per code dim:
-    int hoff[NT];              // see head_argmax; hoff: the range's first block in hu
+    int hnb[NT], hng[NT], goff[NT];  // see head_argmax: blocks and groups per range; goff: the
+    float *glo[NT], *ghi[NT];        // range's first group in hu
     double *hu;
     float *logits, *h;
     uint64_t *hz;      // the residual's nonzero dims
@@ -775,35 +776,58 @@ static float tok_logit(const Model *M, int v) {
     return bf(lg);
 }
 
-static int head_argmax(Model *M) {  // (the blocks are kept by range, as NT threads once took them)
-    int nc = M->ncode, ft = 0, fk = 0;
-    double *u = M->hu;
-    for (int t = 0, o = 0; t < NT; t++) {
-        int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
-        const float *lo = M->hlo[t], *hi = M->hhi[t];
-        for (int k = 0, nb = (v1 - v0 + HB - 1) / HB; k < nb; k++, o++) {
-            double s = 0, a = 0;
-            for (int c = 0; c < nc; c++) {
-                double x = M->hx[c], p = lo[(size_t)k * nc + c] * x, q = hi[(size_t)k * nc + c] * x;
-                s += p > q ? p : q, a += fabs(p) > fabs(q) ? fabs(p) : fabs(q);
-            }
-            u[o] = s + a * ((nc + 2) * 0x1p-24) + 1e-30;
-            if (u[o] > u[M->hoff[ft] + fk]) ft = t, fk = k;
+// The blocks are kept by range (as NT threads once took them), and in groups of HG blocks whose
+// bound is the same over the whole group: a group that cannot reach the best is not opened. Code
+// dims whose input is 0 add nothing to any logit or bound and are left out.
+#define HG 64
+static double head_bound(const Model *M, const float *lo, const float *hi, const int *cd, int nz) {
+    double s = 0, a = 0;
+    for (int i = 0; i < nz; i++) {
+        int c = cd[i];
+        double x = M->hx[c], p = lo[c] * x, q = hi[c] * x;
+        s += p > q ? p : q, a += fabs(p) > fabs(q) ? fabs(p) : fabs(q);
+    }
+    return s + a * ((M->ncode + 2) * 0x1p-24) + 1e-30;
+}
+
+static void head_block(const Model *M, int t, int k, int *best, float *bv) {
+    int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
+    for (int v = v0 + k * HB, e = v + HB < v1 ? v + HB : v1; v < e; v++) {
+        float b = tok_logit(M, v);
+        if (b > *bv || (b == *bv && v < *best)) *bv = b, *best = v;
+    }
+}
+
+static int head_argmax(Model *M) {
+    int nc = M->ncode, cd[64], nz = 0;
+    for (int c = 0; c < nc; c++)
+        if (M->hx[c] != 0.0f) cd[nz++] = c;
+    // the most promising group, and in it the most promising block, first
+    int ft = 0, fg = 0, fk = 0;
+    double fu = -INFINITY;
+    for (int t = 0; t < NT; t++)
+        for (int g = 0; g < M->hng[t]; g++) {
+            double u = head_bound(M, M->glo[t] + (size_t)g * nc, M->ghi[t] + (size_t)g * nc, cd, nz);
+            M->hu[M->goff[t] + g] = u;
+            if (u > fu) fu = u, ft = t, fg = g;
         }
+    fu = -INFINITY;
+    for (int k = fg * HG; k < (fg + 1) * HG && k < M->hnb[ft]; k++) {
+        double u = head_bound(M, M->hlo[ft] + (size_t)k * nc, M->hhi[ft] + (size_t)k * nc, cd, nz);
+        if (u > fu) fu = u, fk = k;
     }
     int best = -1;
     float bv = -INFINITY;
-    for (int pass = 0; pass < 2; pass++)  // the most promising block, then the rest
-        for (int t = 0; t < NT; t++) {
-            int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
-            for (int k = 0, nb = (v1 - v0 + HB - 1) / HB; k < nb; k++) {
-                if ((t == ft && k == fk) != !pass) continue;
-                double cut = (double)bv - fabs((double)bv) * 0x1p-7 - 1e-36;
-                if (best >= 0 && u[M->hoff[t] + k] < cut) continue;
-                for (int v = v0 + k * HB, e = v + HB < v1 ? v + HB : v1; v < e; v++) {
-                    float b = tok_logit(M, v);
-                    if (b > bv || (b == bv && v < best)) bv = b, best = v;
-                }
+    head_block(M, ft, fk, &best, &bv);
+    for (int t = 0; t < NT; t++)
+        for (int g = 0; g < M->hng[t]; g++) {
+            double cut = (double)bv - fabs((double)bv) * 0x1p-7 - 1e-36;
+            if (M->hu[M->goff[t] + g] < cut) continue;
+            for (int k = g * HG; k < (g + 1) * HG && k < M->hnb[t]; k++) {
+                if (t == ft && k == fk) continue;
+                cut = (double)bv - fabs((double)bv) * 0x1p-7 - 1e-36;
+                if (head_bound(M, M->hlo[t] + (size_t)k * nc, M->hhi[t] + (size_t)k * nc, cd, nz) < cut) continue;
+                head_block(M, t, k, &best, &bv);
             }
         }
     return best;
@@ -1139,7 +1163,6 @@ void st_embed(Model *M, const int32_t *erow, const int32_t *ecol, const float *e
     for (int t = 0; t < NT; t++) {
         int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
         int nb = (v1 - v0 + HB - 1) / HB;
-        M->hoff[t] = t ? M->hoff[t - 1] + (int)(((long)t * M->vocab / NT - (long)(t - 1) * M->vocab / NT + HB - 1) / HB) : 0;
         M->hlo[t] = malloc(sizeof(float) * ((size_t)nb * ncode + 1)), M->hhi[t] = malloc(sizeof(float) * ((size_t)nb * ncode + 1));
         for (int k = 0; k < nb; k++)
             for (int c = 0; c < ncode; c++) {
@@ -1150,7 +1173,23 @@ void st_embed(Model *M, const int32_t *erow, const int32_t *ecol, const float *e
                 M->hlo[t][(size_t)k * ncode + c] = lo, M->hhi[t][(size_t)k * ncode + c] = hi;
             }
     }
-    M->hu = malloc(sizeof(double) * (M->vocab / HB + NT + 1));
+    for (int t = 0; t < NT; t++) {  // the groups of blocks
+        int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
+        M->hnb[t] = (v1 - v0 + HB - 1) / HB, M->hng[t] = (M->hnb[t] + HG - 1) / HG;
+        M->goff[t] = t ? M->goff[t - 1] + M->hng[t - 1] : 0;
+        M->glo[t] = malloc(sizeof(float) * ((size_t)M->hng[t] * ncode + 1));
+        M->ghi[t] = malloc(sizeof(float) * ((size_t)M->hng[t] * ncode + 1));
+        for (int g = 0; g < M->hng[t]; g++)
+            for (int c = 0; c < ncode; c++) {
+                float lo = INFINITY, hi = -INFINITY;
+                for (int k = g * HG; k < (g + 1) * HG && k < M->hnb[t]; k++) {
+                    float a = M->hlo[t][(size_t)k * ncode + c], b = M->hhi[t][(size_t)k * ncode + c];
+                    lo = a < lo ? a : lo, hi = b > hi ? b : hi;
+                }
+                M->glo[t][(size_t)g * ncode + c] = lo, M->ghi[t][(size_t)g * ncode + c] = hi;
+            }
+    }
+    M->hu = malloc(sizeof(double) * (M->goff[NT - 1] + M->hng[NT - 1] + 1));
     free(slot);
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (int t = 1; t < NT; t++) {
