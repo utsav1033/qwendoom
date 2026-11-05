@@ -138,7 +138,9 @@ typedef struct {
     float *hval;
     int32_t *tptr, *tc;    // and per token, its entries (code dim, value), in the code dims' order
     float *tv;
-    float *hlo[NT], *hhi[NT];  // per thread, per block of HB tokens, per code dim: see head_range
+    float *hlo[NT], *hhi[NT];  // per vocabulary range, per block of HB tokens, per code dim:
+    int hoff[NT];              // see head_argmax; hoff: the range's first block in hu
+    double *hu;
     float *logits, *h;
     uint64_t *hz;      // the residual's nonzero dims
     Ctx cx[NT];
@@ -773,35 +775,38 @@ static float tok_logit(const Model *M, int v) {
     return bf(lg);
 }
 
-static void head_range(Model *M, int t) {
-    int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
-    int nb = (v1 - v0 + HB - 1) / HB, nc = M->ncode;
-    const float *lo = M->hlo[t], *hi = M->hhi[t];
-    double ub[(230336 / NT) / HB + 2], *u = nb + 2 <= (int)(sizeof ub / sizeof *ub) ? ub : malloc(sizeof(double) * nb);
-    int first = 0;
-    for (int k = 0; k < nb; k++) {
-        double s = 0, a = 0;
-        for (int c = 0; c < nc; c++) {
-            double x = M->hx[c], p = lo[(size_t)k * nc + c] * x, q = hi[(size_t)k * nc + c] * x;
-            s += p > q ? p : q, a += fabs(p) > fabs(q) ? fabs(p) : fabs(q);
+static int head_argmax(Model *M) {  // (the blocks are kept by range, as NT threads once took them)
+    int nc = M->ncode, ft = 0, fk = 0;
+    double *u = M->hu;
+    for (int t = 0, o = 0; t < NT; t++) {
+        int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
+        const float *lo = M->hlo[t], *hi = M->hhi[t];
+        for (int k = 0, nb = (v1 - v0 + HB - 1) / HB; k < nb; k++, o++) {
+            double s = 0, a = 0;
+            for (int c = 0; c < nc; c++) {
+                double x = M->hx[c], p = lo[(size_t)k * nc + c] * x, q = hi[(size_t)k * nc + c] * x;
+                s += p > q ? p : q, a += fabs(p) > fabs(q) ? fabs(p) : fabs(q);
+            }
+            u[o] = s + a * ((nc + 2) * 0x1p-24) + 1e-30;
+            if (u[o] > u[M->hoff[ft] + fk]) ft = t, fk = k;
         }
-        u[k] = s + a * ((nc + 2) * 0x1p-24) + 1e-30;
-        if (u[k] > u[first]) first = k;
     }
     int best = -1;
     float bv = -INFINITY;
     for (int pass = 0; pass < 2; pass++)  // the most promising block, then the rest
-        for (int k = pass ? 0 : first; k < (pass ? nb : first + 1); k++) {
-            if (pass && k == first) continue;
-            double cut = (double)bv - fabs((double)bv) * 0x1p-7 - 1e-36;
-            if (best >= 0 && u[k] < cut) continue;
-            for (int v = v0 + k * HB, e = v + HB < v1 ? v + HB : v1; v < e; v++) {
-                float b = tok_logit(M, v);
-                if (b > bv || (b == bv && v < best)) bv = b, best = v;
+        for (int t = 0; t < NT; t++) {
+            int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
+            for (int k = 0, nb = (v1 - v0 + HB - 1) / HB; k < nb; k++) {
+                if ((t == ft && k == fk) != !pass) continue;
+                double cut = (double)bv - fabs((double)bv) * 0x1p-7 - 1e-36;
+                if (best >= 0 && u[M->hoff[t] + k] < cut) continue;
+                for (int v = v0 + k * HB, e = v + HB < v1 ? v + HB : v1; v < e; v++) {
+                    float b = tok_logit(M, v);
+                    if (b > bv || (b == bv && v < best)) bv = b, best = v;
+                }
             }
         }
-    if (u != ub) free(u);
-    M->bv[t] = bv, M->best[t] = best;
+    return best;
 }
 
 // causal_conv1d_update and silu, in bf16, for conv segment k. The sum is torch's,
@@ -1089,10 +1094,6 @@ static void *worker(void *p) {
             __asm__ volatile("yield");
         seen = g;
         layers(M, a.t);
-        if (M->head) {
-            bar(M, &M->cx[a.t]);  // the final norm's values are in hx
-            head_range(M, a.t);
-        }
         atomic_fetch_add_explicit(&M->done, 1, memory_order_release);
     }
 }
@@ -1138,6 +1139,7 @@ void st_embed(Model *M, const int32_t *erow, const int32_t *ecol, const float *e
     for (int t = 0; t < NT; t++) {
         int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
         int nb = (v1 - v0 + HB - 1) / HB;
+        M->hoff[t] = t ? M->hoff[t - 1] + (int)(((long)t * M->vocab / NT - (long)(t - 1) * M->vocab / NT + HB - 1) / HB) : 0;
         M->hlo[t] = malloc(sizeof(float) * ((size_t)nb * ncode + 1)), M->hhi[t] = malloc(sizeof(float) * ((size_t)nb * ncode + 1));
         for (int k = 0; k < nb; k++)
             for (int c = 0; c < ncode; c++) {
@@ -1148,6 +1150,7 @@ void st_embed(Model *M, const int32_t *erow, const int32_t *ecol, const float *e
                 M->hlo[t][(size_t)k * ncode + c] = lo, M->hhi[t][(size_t)k * ncode + c] = hi;
             }
     }
+    M->hu = malloc(sizeof(double) * (M->vocab / HB + NT + 1));
     free(slot);
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (int t = 1; t < NT; t++) {
@@ -1171,20 +1174,16 @@ int st_step(Model *M, int tok, int head) {
     atomic_store_explicit(&M->done, 0, memory_order_relaxed);
     atomic_fetch_add_explicit(&M->gen, 1, memory_order_release);
     layers(M, 0);
+    int best = -1;
     if (head) {
-        // the final norm (its gain is 0 outside the code dims) and the output head
+        // the final norm (its gain is 0 outside the code dims) and the output head. The residual
+        // is final here: the last layer that wrote it ended at a barrier
         float rs = rms_scale(M);
         for (int k = 0; k < M->ncode; k++) M->hx[k] = normed(M, M->norm, rs, M->code[k]);
-        bar(M, &M->cx[0]);
-        head_range(M, 0);
+        best = head_argmax(M);
     }
     while (atomic_load_explicit(&M->done, memory_order_acquire) < NT - 1) __asm__ volatile("yield");
     M->tick++;
-    if (!head) return -1;
-    int best = M->best[0];
-    float bv = M->bv[0];
-    for (int t = 1; t < NT; t++)
-        if (M->bv[t] > bv) bv = M->bv[t], best = M->best[t];
     return best;
 }
 
