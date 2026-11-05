@@ -8,21 +8,23 @@ that memory once, before the first token. After that, its only job is to compute
 token at a time and feed each token back in: it never runs a Doom instruction or touches Doom's
 memory again.
 
-![The model's first 40 frames: Doom's screen melt into the first room](docs/img/model-frames.gif)
+![Doom on the model: its first frames, then the game playing in the emulator](docs/img/hero.gif)
 
-*The first 40 frames drawn by the model: Doom's screen melt, then the first room. Every frame
-is read out of the model's own memory.*
+*First 4 seconds: frames drawn by the model, read out of its own memory, with its real token
+counts and run time. Then the game playing in the emulator (same machine, labelled), with the
+tokens the model would need to get there. Bottom left: RISC-V instructions Doom is running.
+[Full-quality video](docs/media/hero.mp4).*
 
 ![Frame 39: the model next to rvemu, 0 pixels different](docs/img/model-vs-rvemu.png)
 
 **Where it stands (Nov 5, 2026):** one continuous run on a MacBook, from Doom's first
-instruction. The model booted Doom (63M tokens, 36.4M instructions) and drew its first 40 frames,
+instruction. The model booted Doom (63M tokens, 36.4M instructions) and drew its first 41 frames,
 every token equal to the one Qwenputer's reference CPU (a plain Python emulator of the same
 machine) produces, and every frame **0 pixels different** from the emulator's. The run stops at
-the first difference. It keeps going at ~3,700 tokens/s, about 12 minutes per gameplay frame.
+the first difference. It runs at ~3,700 tokens/s, ~3.7M tokens and ~17 minutes per gameplay frame. It's paused for now and resumes from its checkpoint.
 (The whole demo, 7,155 frames, would take about two months at this speed.)
 
-![How Doom runs inside Qwen](docs/img/overview.svg)
+![The stack: Doom, the RISC-V program, the model's 328 layers to scale, the stepper](docs/img/stack.png)
 
 ```
                            Doom Generic 0.1
@@ -157,8 +159,10 @@ clean frame of the level.
 | ✅ Real Doom compiled for the machine | the whole demo plays in the emulator, same pixels as native |
 | ✅ The model runs Doom's boot | every token so far equal to the reference CPU's |
 | ✅ Reading memory back out of the model | equal to the reference machine's RAM |
-| ✅ Frames drawn by the model | the first 40, 0 pixels different from the emulator; the run continues |
+| ✅ Frames drawn by the model | 41 so far, 0 pixels different from the emulator (the run is paused, resumable) |
 | ⏳ Faster | ~270 µs per token now: about a third is the RISC-V CPU's own circuit, the rest overhead |
+
+![Every token checked: 76.2M tokens, 0 mismatches, 41 frames 0 pixels off](docs/img/verified.png)
 
 **What "inside the model" means here:** the program and its data are written into the model's
 memory once, before the first token, like flashing a chip. After that, every token is the
