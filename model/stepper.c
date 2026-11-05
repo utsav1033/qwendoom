@@ -56,8 +56,8 @@ typedef struct {  // a weight matrix by input: input j's outputs rows[colptr[j].
     int32_t *rptr, *rrow, *rpos, *rlen;
     int nlr;
     int32_t *lrow, *llen;
-    int ncol;
-    int32_t *col;   // the inputs with any weight, ascending
+    int ncol, compact;
+    int32_t *col;   // the inputs with any weight, ascending (compact: rptr is by position in col)
     // the ballast inputs (the first nb dims: they come first in every sum, and never change):
     // each live output's partial sum over them, made for the ballast values bx
     int nb, base_ok;
@@ -65,6 +65,16 @@ typedef struct {  // a weight matrix by input: input j's outputs rows[colptr[j].
 } Mat;
 
 enum { QKV, Z, B, A, O, GATE, UP, DOWN, NMAT };
+
+typedef struct {  // see bound_init
+    int ok, n, bias;  // bias: the folded column's position (-1: none)
+    double c;         // its constant part
+    int32_t *col;
+    float *lo, *hi;
+    double *dhi;      // the folded column's part that goes with hi (times its input)
+    int32_t *lead;    // a two-valued column's group (the first column of the same row split), -1
+    char *flip;       // 1: the column's hi rows are its group's lo rows
+} Bound;
 
 typedef struct {
     Mat m[NMAT];       // whole (only its live outputs kept, for counts)
@@ -77,10 +87,23 @@ typedef struct {
     // thread t's conv channels as segments of one tap pattern and the same weights: segment k is
     // channels cc0[k] .. + cn[k], taps cmask[k] (bit i: tap i, 0 the oldest, has a nonzero weight),
     // weights cwt[k][0..3]
-    int nseg[NT];
-    int32_t *cc0[NT], *cn[NT];
-    uint8_t *cmask[NT];
-    float (*cwt[NT])[4];
+    // key head j's QKV outputs as three blocks, g = j (queries), NK + j (keys), 2 NK + j (its
+    // value heads' values): block g's matrix qb[g], its conv segments sg0[g] .. sg0[g + 1] (of one
+    // tap pattern and the same weights: channels cc0[k] .. + cn[k], taps cmask[k], bit i for tap
+    // i, 0 the oldest, weights cwt[k][0..3]), and for queries and keys a bound (Bound)
+    Mat *qb, *zh, *bh;  // and key head j's rows of Z (its value heads' gates) and of B (betas)
+    Bound *bnd;
+    int32_t *sg0, *cc0, *cn;
+    uint8_t *cmask;
+    float (*cwt)[4];
+    int32_t *icol[NT], nicol[NT], *pcol[NT], npcol[NT];  // the inputs thread t's products read,
+                                                         // after the input / post norm
+    // a key head's values are made only when it writes (they are read by nothing else): those of
+    // this token from its inputs, and the past ones its conv reads from the inputs of the tokens
+    // before, kept here: thread t's normed inputs (its icol) of token T in xh[t] + (T % 3) * nicol
+    float *xh[NT];
+    char *kdead;  // key head j's keys were all shown below -100 at the last token (so its keys
+                  // now, the conv of those, are all -0 and the conv state was not kept for them)
     float *qkv, *z, *bb, *aa, *cv, *y, *o, *g, *u, *mm, *dn;  // stay 0 outside live outputs
     int32_t *yl, *yn;  // value head v's nonzero outputs: yl[v * K ..], yn[v] of them
     int32_t *ml, mn[NT];  // thread t's nonzero MLP units: ml[fstart[t] ..], mn[t] of them
@@ -90,7 +113,7 @@ typedef struct {
 } Layer;
 
 typedef struct {  // a thread's own buffers
-    float *acc;
+    float *acc, *xn, *xp, *past[3];  // xp: a past token's normed inputs; past: its QKV values
     int32_t *li;
     int sense;
 } Ctx;
@@ -179,6 +202,16 @@ static void mat_init(Mat *m, int nin, int nout, const int32_t *cp, const int32_t
     }
 }
 
+// rptr by position in col instead of by input (for matvec_n, which walks col)
+static void mat_compact(Mat *m) {
+    int32_t *p = malloc(sizeof(int32_t) * (m->ncol + 1));
+    for (int c = 0; c < m->ncol; c++) p[c] = m->rptr[m->col[c]];
+    p[m->ncol] = m->rptr[m->nin];
+    free(m->rptr);
+    m->rptr = p, m->compact = 1;
+    m->col = realloc(m->col, sizeof(int32_t) * (m->ncol + 1));
+}
+
 static void mat_free_runs(Mat *m) {
     free(m->rptr), free(m->rrow), free(m->rpos), free(m->rlen), free(m->lrow), free(m->llen);
     free(m->col), free(m->w16);
@@ -216,26 +249,24 @@ static void matvec(const Mat *m, const float *x, const int32_t *xi, int nx, floa
         for (int i = m->lrow[k], e = i + m->llen[k]; i < e; i++) y[i] = bf(acc[i]);
 }
 
-static inline float normed(const Model *M, const float *w, float r, int j);
-
-// y = bf16(W rmsnorm(h)) on W's live outputs, reading only the inputs W has weights for: each
-// normed value made where it is used (r is the norm's scale). The sums over the ballast inputs,
-// which lead every sum, are kept from the last token with the same values.
-static void matvec_n(const Model *M, const Mat *m_, const float *w, float r, float *y, float *acc) {
+// y = bf16(W x) on W's live outputs, x the normed residual (xn: made for the inputs W reads),
+// reading only the inputs W has weights for. The sums over the ballast inputs, which lead every
+// sum, are kept from the last token with the same values.
+static void matvec_n(const Mat *m_, const float *xn, float *y, float *acc) {
     Mat *m = (Mat *)m_;
     int c0 = 0;
     if (m->nb) {
         int nc = 0, same = m->base_ok;
         float xb[16];
         while (nc < m->ncol && m->col[nc] < m->nb) nc++;
-        for (int c = 0; c < nc; c++) xb[c] = normed(M, w, r, m->col[c]), same &= xb[c] == m->bx[c];
+        for (int c = 0; c < nc; c++) xb[c] = xn[m->col[c]], same &= xb[c] == m->bx[c];
         if (same) {
             live_fill(m, acc, m->base);
         } else {  // make the partial sums over the ballast inputs
             live_fill(m, acc, NULL);
             for (int c = 0; c < nc; c++) {
                 m->bx[c] = xb[c];
-                if (xb[c] != 0.0f) addcol(m, m->col[c], xb[c], acc);
+                if (xb[c] != 0.0f) addcol(m, m->compact ? c : m->col[c], xb[c], acc);
             }
             if (!m->base) m->base = malloc(sizeof(float) * (m->nlive + 1));
             for (int k = 0, o = 0; k < m->nlr; k++, o += m->llen[k - 1])
@@ -248,11 +279,150 @@ static void matvec_n(const Model *M, const Mat *m_, const float *w, float r, flo
     }
     for (int c = c0; c < m->ncol; c++) {
         int j = m->col[c];
-        float xv = normed(M, w, r, j);
-        if (xv != 0.0f) addcol(m, j, xv, acc);
+        float xv = xn[j];
+        if (xv != 0.0f) addcol(m, m->compact ? c : j, xv, acc);
     }
     for (int k = 0; k < m->nlr; k++)
         for (int i = m->lrow[k], e = i + m->llen[k]; i < e; i++) y[i] = bf(acc[i]);
+}
+
+// A block of QKV outputs (one key head's queries or keys) that can be shown, from this token's
+// inputs, to be all far below zero: then each is a SiLU of less than -89, -0.0 exactly, and the
+// block need not be computed. For every input the block reads, lo/hi are the least and greatest
+// weight over the block's outputs (0 among them where an output has none), so each output's sum
+// is at most sum_j max(lo_j x_j, hi_j x_j). The stepper's float sum of n terms differs from the
+// exact one by at most (n + 1) u sum|terms| (u = 2^-24, the products' roundings included), and
+// bf16 rounding keeps a value below -100 below -100; the conv passes it through (one tap of
+// weight 1, checked when the block is made). A block whose terms are all zero is dead too: its outputs are 0.
+
+//
+// The address rows of a block are all the patterns of a few bits: a column of such a bit has two
+// weights (one per value of the row's bit), and the bias column's weight is a constant plus a part
+// per bit. Taken column by column, the bound would pair each bit's larger term with the bias of
+// another row; so where a block's one other varying column is, on every row, exactly c plus a dhi_j
+// for each two-valued column j whose row has hi there, that part is folded into column j: the
+// bound is then sum_j max(lo_j x_j, hi_j x_j + dhi_j x_bias) + c x_bias, still above every row
+// (the row's own terms are one of the two, column by column) and now its exact maximum. Columns
+// that split the rows the same way (a bit read from two places) are taken together: a row's
+// terms over the group are one of two sums, and the bound takes the larger.
+static void bound_init(Bound *b, const Mat *m, int ok) {
+    int nc = m->ncol, nr = m->nlive;
+    b->ok = ok || nr == 0, b->n = nc, b->bias = -1, b->c = 0;  // (no outputs: nothing nonzero)
+    b->col = malloc(sizeof(int32_t) * (nc + 1));
+    b->lo = malloc(sizeof(float) * (nc + 1)), b->hi = malloc(sizeof(float) * (nc + 1));
+    b->dhi = calloc(nc + 1, sizeof(double));
+    b->lead = malloc(sizeof(int32_t) * (nc + 1)), b->flip = calloc(nc + 1, 1);
+    for (int c = 0; c < nc; c++) b->lead[c] = -1;
+    double *W = calloc((size_t)nr * nc + 1, sizeof(double));  // W[row][col], rows by live index
+    int *ri = malloc(sizeof(int) * (m->nout + 1));
+    for (int u = 0; u < nr; u++) ri[m->live[u]] = u;
+    for (int c = 0; c < nc; c++) {
+        b->col[c] = m->col[c];
+        for (int k = m->rptr[c]; k < m->rptr[c + 1]; k++)
+            for (int i = 0; i < m->rlen[k]; i++) {
+                uint32_t u = (uint32_t)m->w16[m->rpos[k] + i] << 16;
+                float w;
+                memcpy(&w, &u, 4);
+                W[(size_t)ri[m->rrow[k] + i] * nc + c] = w;
+            }
+        float lo = INFINITY, hi = -INFINITY;
+        for (int r = 0; r < nr; r++) {
+            float w = (float)W[(size_t)r * nc + c];
+            lo = w < lo ? w : lo, hi = w > hi ? w : hi;
+        }
+        b->lo[c] = lo, b->hi[c] = hi;
+    }
+    // the columns of two values, and the one of more (the bias) if there is just one
+    char *two = calloc(nc + 1, 1);
+    int many = 0, cb = -1;
+    for (int c = 0; c < nc; c++) {
+        int k = 1;
+        for (int r = 0; r < nr; r++) {
+            double w = W[(size_t)r * nc + c];
+            if (w != b->lo[c] && w != b->hi[c]) k = 3;
+        }
+        if (b->lo[c] != b->hi[c]) k = k == 3 ? 3 : 2;
+        if (k == 2) two[c] = 1;
+        if (k == 3) many++, cb = c;
+    }
+    if (nr <= 1024 && nc <= 1024) {  // the groups of two-valued columns
+        uint64_t (*sig)[16] = calloc(nc + 1, sizeof *sig);
+        for (int j = 0; j < nc; j++) {
+            if (!two[j]) continue;
+            for (int r = 0; r < nr; r++)
+                if (W[(size_t)r * nc + j] == b->hi[j]) sig[j][r >> 6] |= 1ull << (r & 63);
+            for (int j0 = 0; j0 < j && two[j]; j0++) {
+                if (two[j0] != 1) continue;
+                int same = 1, other = 1;
+                for (int w = 0; w < (nr + 63) / 64; w++) {
+                    uint64_t all = (nr - 64 * w >= 64) ? ~0ull : (1ull << (nr - 64 * w)) - 1;
+                    same &= sig[j][w] == sig[j0][w], other &= sig[j][w] == (~sig[j0][w] & all);
+                }
+                if (same || other) {
+                    two[j] = 2, b->lead[j] = j0, b->flip[j] = (char)other;  // (in j0's group)
+                    break;
+                }
+            }
+            if (two[j] == 1) b->lead[j] = j;
+        }
+        free(sig);
+    }
+    if (many == 1 && nr > 1 && nr <= 1024 && nc <= 1024) {
+        // fit bias = c + sum_j dhi_j [row hi at j] over the groups' first columns, then check
+        // every row
+        double *d = calloc(nc + 1, sizeof(double)), mean = 0;
+        for (int r = 0; r < nr; r++) mean += W[(size_t)r * nc + cb] / nr;
+        double cc = mean;
+        for (int j = 0; j < nc; j++) {
+            if (two[j] != 1) continue;
+            double sh = 0, sl = 0;
+            int nh = 0;
+            for (int r = 0; r < nr; r++) {
+                double w = W[(size_t)r * nc + cb];
+                if (W[(size_t)r * nc + j] == b->hi[j]) sh += w, nh++; else sl += w;
+            }
+            if (nh == 0 || nh == nr) continue;
+            d[j] = sh / nh - sl / (nr - nh);
+            cc -= d[j] * nh / nr;
+        }
+        int fits = 1;
+        for (int r = 0; r < nr && fits; r++) {
+            double v = cc;
+            for (int j = 0; j < nc; j++)
+                if (two[j] == 1 && W[(size_t)r * nc + j] == b->hi[j]) v += d[j];
+            fits = fabs(v - W[(size_t)r * nc + cb]) <= 1e-6 * (1 + fabs(W[(size_t)r * nc + cb]));
+        }
+        if (fits) {
+            b->bias = cb, b->c = cc;
+            for (int j = 0; j < nc; j++) b->dhi[j] = two[j] == 1 ? d[j] : 0;
+        }
+        free(d);
+    }
+    free(two), free(W), free(ri);
+}
+
+static int bound_dead(const Bound *b, const float *xn) {
+    if (!b->ok) return 0;
+    double ub = 0, ab = 0, xb = b->bias >= 0 ? xn[b->col[b->bias]] : 0, glo[1024], ghi[1024];
+    if (!isfinite(xb)) return 0;
+    for (int c = 0; c < b->n; c++)
+        if (b->lead[c] == c) glo[c] = 0, ghi[c] = b->dhi[c] * xb;
+    for (int c = 0; c < b->n; c++) {
+        double x = xn[b->col[c]];
+        if (!isfinite(x)) return 0;
+        double p = b->lo[c] * x, q = b->hi[c] * x;
+        ab += fabs(p) > fabs(q) ? fabs(p) : fabs(q);  // (|terms|, for the rounding: not folded)
+        if (c == b->bias) continue;
+        int g = b->lead[c];
+        if (g < 0) ub += p > q ? p : q;
+        else if (b->flip[c]) glo[g] += q, ghi[g] += p;
+        else glo[g] += p, ghi[g] += q;
+    }
+    for (int c = 0; c < b->n; c++)
+        if (b->lead[c] == c) ub += glo[c] > ghi[c] ? glo[c] : ghi[c];
+    if (b->bias >= 0) ub += b->c * xb;
+    // (every term zero: every output is exactly 0, its conv 0, its SiLU 0: also none nonzero)
+    return ab == 0 || ub + ab * ((b->n + 2) * 0x1p-24 + 1e-12) < -100.0;
 }
 
 static inline void hz_set(Model *M, int i, float v) {
@@ -287,6 +457,8 @@ Model *st_new(int nl, int D, int F, int NK, int NV, int vocab) {
     for (int t = 0; t < NT; t++) {
         Ctx *c = &M->cx[t];
         c->acc = calloc(big, sizeof(float)), c->li = malloc(sizeof(int32_t) * big);
+        c->xn = calloc(D, sizeof(float)), c->xp = calloc(D, sizeof(float));
+        for (int k = 0; k < 3; k++) c->past[k] = calloc(2 * NK * K + NV * K, sizeof(float));
     }
     return M;
 }
@@ -375,13 +547,7 @@ void st_layer(Model *M, int layer, const float *conv, const float *A_log, const 
     double *w = malloc(sizeof(double) * (C > F ? (C > D ? C : D) : (F > D ? F : D)));
     for (int t = 0; t < NT; t++) {
         const Mat *f;
-        for (int c = 0; c < C; c++)
-            own[c] = hg[c < QK ? c / K : c < 2 * QK ? (c - QK) / K : (c - 2 * QK) / K / r];
-        f = &L->m[QKV], mat_init(&L->sub[QKV][t], f->nin, f->nout, f->colptr, f->rows, f->vals, own, t);
-        for (int o = 0; o < NV * K; o++) own[o] = hg[o / K / r];
-        f = &L->m[Z], mat_init(&L->sub[Z][t], f->nin, f->nout, f->colptr, f->rows, f->vals, own, t);
         for (int v = 0; v < NV; v++) own[v] = hg[v / r];
-        f = &L->m[B], mat_init(&L->sub[B][t], f->nin, f->nout, f->colptr, f->rows, f->vals, own, t);
         f = &L->m[A], mat_init(&L->sub[A][t], f->nin, f->nout, f->colptr, f->rows, f->vals, own, t);
     }
     // the out and down projections by 64-row ranges of the residual (a thread then owns whole
@@ -406,30 +572,79 @@ void st_layer(Model *M, int layer, const float *conv, const float *A_log, const 
                 if (L->fstart[t] > L->fstart[t + 1]) L->fstart[t] = L->fstart[t + 1];
         }
     }
-    for (int t = 0; t < NT; t++) {  // the conv segments, over thread t's live QKV channels
-        const Mat *mq = &L->sub[QKV][t];
-        int n = 0;
-        L->cc0[t] = malloc(sizeof(int32_t) * (mq->nlive + 1)), L->cn[t] = malloc(sizeof(int32_t) * (mq->nlive + 1));
-        L->cmask[t] = malloc(mq->nlive + 1), L->cwt[t] = malloc(sizeof(float[4]) * (mq->nlive + 1));
-        for (int u = 0; u < mq->nlive; u++) {
-            int c = mq->live[u], mask = 0;
-            const float *w = conv + c * CONV;
-            for (int k = 0; k < CONV; k++) mask |= (w[k] != 0.0f) << k;
-            if (n && L->cc0[t][n - 1] + L->cn[t][n - 1] == c && L->cmask[t][n - 1] == mask &&
-                !memcmp(L->cwt[t][n - 1], w, sizeof(float) * CONV)) {
-                L->cn[t][n - 1]++;
-                continue;
+    {  // the QKV blocks, their conv segments and bounds
+        int NG = 3 * NK, nlive = L->m[QKV].nlive, n = 0;
+        for (int c = 0; c < C; c++) own[c] = (char)(c < QK ? c / K : c < 2 * QK ? NK + (c - QK) / K : 2 * NK + (c - 2 * QK) / K / r);
+        L->qb = calloc(NG, sizeof(Mat)), L->bnd = calloc(2 * NK, sizeof(Bound));
+        L->sg0 = malloc(sizeof(int32_t) * (NG + 1)), L->kdead = calloc(NK, 1);
+        L->cc0 = malloc(sizeof(int32_t) * (nlive + 1)), L->cn = malloc(sizeof(int32_t) * (nlive + 1));
+        L->cmask = malloc(nlive + 1), L->cwt = malloc(sizeof(float[4]) * (nlive + 1));
+        const Mat *f = &L->m[QKV];
+        for (int g = 0; g < NG; g++) {
+            Mat *b = &L->qb[g];
+            mat_init(b, f->nin, f->nout, f->colptr, f->rows, f->vals, own, g);
+            b->nb = f->nb;
+            mat_compact(b);
+            L->sg0[g] = n;
+            int pass = 1;  // queries: the current token's tap only, weight 1; keys: the last token's
+            for (int u = 0; u < b->nlive; u++) {
+                int c = b->live[u], mask = 0;
+                const float *w = conv + c * CONV;
+                for (int k = 0; k < CONV; k++) mask |= (w[k] != 0.0f) << k;
+                if (g < NK) pass &= mask == 8 && w[3] == 1.0f;
+                else if (g < 2 * NK) pass &= mask == 4 && w[2] == 1.0f;
+                if (n > L->sg0[g] && L->cc0[n - 1] + L->cn[n - 1] == c && L->cmask[n - 1] == mask &&
+                    !memcmp(L->cwt[n - 1], w, sizeof(float) * CONV)) {
+                    L->cn[n - 1]++;
+                    continue;
+                }
+                L->cc0[n] = c, L->cn[n] = 1, L->cmask[n] = (uint8_t)mask;
+                memcpy(L->cwt[n], w, sizeof(float) * CONV);
+                n++;
             }
-            L->cc0[t][n] = c, L->cn[t][n] = 1, L->cmask[t][n] = (uint8_t)mask;
-            memcpy(L->cwt[t][n], w, sizeof(float) * CONV);
-            n++;
+            if (g < 2 * NK) bound_init(&L->bnd[g], b, pass);
+            free(b->live), b->live = NULL;
         }
-        L->nseg[t] = n;
+        L->sg0[NG] = n;
+        L->zh = calloc(NK, sizeof(Mat)), L->bh = calloc(NK, sizeof(Mat));
+        for (int o = 0; o < NV * K; o++) own[o] = (char)(o / K / r);
+        for (int j = 0; j < NK; j++) {
+            f = &L->m[Z], mat_init(&L->zh[j], f->nin, f->nout, f->colptr, f->rows, f->vals, own, j);
+            L->zh[j].nb = f->nb, mat_compact(&L->zh[j]);
+        }
+        for (int v = 0; v < NV; v++) own[v] = (char)(v / r);
+        for (int j = 0; j < NK; j++) {
+            f = &L->m[B], mat_init(&L->bh[j], f->nin, f->nout, f->colptr, f->rows, f->vals, own, j);
+            L->bh[j].nb = f->nb, mat_compact(&L->bh[j]);
+        }
     }
     L->nomlp = L->m[GATE].nlive == 0 && L->m[UP].nlive == 0 && L->m[DOWN].nlive == 0;
+    for (int t = 0; t < NT; t++) {  // the inputs each thread's products read
+        char *in = calloc(D, 1), *post = calloc(D, 1);
+        for (int c = 0; c < L->sub[A][t].ncol; c++) in[L->sub[A][t].col[c]] = 1;
+        for (int hh = 0; hh < L->nh[t]; hh++) {
+            int j = L->heads[t][hh];
+            const Mat *ms[5] = {&L->qb[j], &L->qb[NK + j], &L->qb[2 * NK + j], &L->zh[j], &L->bh[j]};
+            for (int b = 0; b < 5; b++)
+                for (int c = 0; c < ms[b]->ncol; c++) in[ms[b]->col[c]] = 1;
+        }
+        for (int c = 0; c < L->sub[GATE][t].ncol; c++) post[L->sub[GATE][t].col[c]] = 1;
+        for (int c = 0; c < L->sub[UP][t].ncol; c++) post[L->sub[UP][t].col[c]] = 1;
+        L->icol[t] = malloc(sizeof(int32_t) * (D + 1)), L->pcol[t] = malloc(sizeof(int32_t) * (D + 1));
+        L->nicol[t] = L->npcol[t] = 0;
+        for (int i = 0; i < D; i++) {
+            if (in[i]) L->icol[t][L->nicol[t]++] = i;
+            if (post[i]) L->pcol[t][L->npcol[t]++] = i;
+        }
+        free(in), free(post);
+        L->xh[t] = calloc((size_t)3 * L->nicol[t] + 1, sizeof(float));
+    }
     for (int m = 0; m < NMAT; m++) {
         mat_free_runs(&L->m[m]);
-        for (int t = 0; t < NT; t++) L->sub[m][t].nb = L->m[m].nb;
+        for (int t = 0; t < NT; t++) {
+            L->sub[m][t].nb = L->m[m].nb;
+            if (m == A || m == GATE || m == UP) mat_compact(&L->sub[m][t]);
+        }
     }
     free(own), free(w);
 }
@@ -444,18 +659,23 @@ float *st_state(Model *M, int layer) { return M->L[layer].S; }
 
 int st_nonfinite(Model *M) { return M->nonfinite; }
 
-// The state a run carries from token to token (the recurrent states, the conv states and which
-// value heads wrote an output, and the token count), to a file and back; 0 on success.
+// The state a run carries from token to token (the recurrent states, the conv states, which
+// value heads wrote an output, which key heads' keys were dead, the last 3 tokens' normed inputs,
+// and the token count), to a file and back; 0 on success. (Files from before the kept inputs do
+// not load: their conv states are what this stepper no longer keeps.)
 int st_save(Model *M, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    int C = 2 * M->NK * K + M->NV * K, hdr[6] = {0x51444d31, M->nl, M->NV, K, C, M->tick};
+    int C = 2 * M->NK * K + M->NV * K, hdr[6] = {0x51444d33, M->nl, M->NV, K, C, M->tick};
     int ok = fwrite(hdr, sizeof hdr, 1, f) == 1;
     for (int l = 0; l < M->nl && ok; l++) {
         Layer *L = &M->L[l];
         ok = fwrite(L->S, sizeof(float), (size_t)M->NV * K * K, f) == (size_t)M->NV * K * K &&
              fwrite(L->cs, sizeof(float), (size_t)C * (CONV - 1), f) == (size_t)C * (CONV - 1) &&
-             fwrite(L->act, 1, M->NV, f) == (size_t)M->NV;
+             fwrite(L->act, 1, M->NV, f) == (size_t)M->NV &&
+             fwrite(L->kdead, 1, M->NK, f) == (size_t)M->NK;
+        for (int t = 0; t < NT && ok; t++)
+            ok = fwrite(L->xh[t], sizeof(float), (size_t)3 * L->nicol[t], f) == (size_t)3 * L->nicol[t];
     }
     return fclose(f) == 0 && ok ? 0 : -1;
 }
@@ -464,13 +684,16 @@ int st_load(Model *M, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     int C = 2 * M->NK * K + M->NV * K, hdr[6];
-    int ok = fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x51444d31 && hdr[1] == M->nl &&
+    int ok = fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x51444d33 && hdr[1] == M->nl &&
              hdr[2] == M->NV && hdr[3] == K && hdr[4] == C;
     for (int l = 0; l < M->nl && ok; l++) {
         Layer *L = &M->L[l];
         ok = fread(L->S, sizeof(float), (size_t)M->NV * K * K, f) == (size_t)M->NV * K * K &&
              fread(L->cs, sizeof(float), (size_t)C * (CONV - 1), f) == (size_t)C * (CONV - 1) &&
              fread(L->act, 1, M->NV, f) == (size_t)M->NV;
+        ok = ok && fread(L->kdead, 1, M->NK, f) == (size_t)M->NK;
+        for (int t = 0; t < NT && ok; t++)
+            ok = fread(L->xh[t], sizeof(float), (size_t)3 * L->nicol[t], f) == (size_t)3 * L->nicol[t];
         memset(L->y, 0, sizeof(float) * M->NV * K);  // (a head marked active rewrites or clears it)
     }
     fclose(f);
@@ -484,6 +707,8 @@ void st_reset(Model *M) {
     for (int l = 0; l < M->nl; l++) {
         memset(M->L[l].S, 0, sizeof(float) * M->NV * K * K);
         memset(M->L[l].cs, 0, sizeof(float) * C * (CONV - 1));
+        memset(M->L[l].kdead, 0, M->NK);
+        for (int t = 0; t < NT; t++) memset(M->L[l].xh[t], 0, sizeof(float) * 3 * M->L[l].nicol[t]);
     }
 }
 
@@ -513,6 +738,74 @@ static void head_range(Model *M, int t) {
     M->bv[t] = bv, M->best[t] = best;
 }
 
+// causal_conv1d_update and silu, in bf16, for conv segment k. The sum is torch's,
+// ((s0 w0 + s1 w1) + s2 w2) + x w3, with the zero-weight terms left out: each is a zero (the
+// states are finite; st_nonfinite counts any that is not), so leaving it out changes at most the
+// sign of a zero sum. Only channels with a past tap keep a state. out: make the output; keep:
+// this token's values (qkv) are made, so check them and keep them as the state.
+static void conv_seg(Model *M, Layer *L, int k, const float *qkv, float *cv, float *p3,
+                     const float *p2, const float *p1, int out, int keep) {
+    const float *w = L->cwt[k];
+    int mask = L->cmask[k];
+    float tmp[4096];
+    for (int c0 = L->cc0[k], e = c0 + L->cn[k]; c0 < e; c0 += 4096) {
+        int n = e - c0 < 4096 ? e - c0 : 4096;
+        const float *q = qkv + c0, *s2 = p2 + c0, *s1 = p1 + c0;
+        float *s3 = p3 + c0;
+        if (out) {
+            switch (mask) {
+            case 8:
+                for (int i = 0; i < n; i++) tmp[i] = bf(q[i] * w[3]);
+                break;
+            case 4:
+                for (int i = 0; i < n; i++) tmp[i] = bf(s1[i] * w[2]);
+                break;
+            case 9:
+                for (int i = 0; i < n; i++) tmp[i] = bf(s3[i] * w[0] + q[i] * w[3]);
+                break;
+            case 10:
+                for (int i = 0; i < n; i++) tmp[i] = bf(s2[i] * w[1] + q[i] * w[3]);
+                break;
+            default:
+                for (int i = 0; i < n; i++)
+                    tmp[i] = bf(s3[i] * w[0] + s2[i] * w[1] + s1[i] * w[2] + q[i] * w[3]);
+            }
+        }
+        if (keep) {
+            if (mask & 7) memcpy(s3, q, sizeof(float) * n);
+            uint32_t top = 0;  // the largest |x| bits: inf or NaN is >= 0x7f800000
+            for (int i = 0; i < n; i++) {
+                uint32_t u;
+                memcpy(&u, &q[i], 4);
+                u &= 0x7fffffff;
+                top = u > top ? u : top;
+            }
+            if (top >= 0x7f800000) atomic_fetch_add_explicit(&M->nonfinite, 1, memory_order_relaxed);
+        }
+        if (!out) continue;
+        // below -89, expf(-x) overflows to inf and x / inf is -0.0 (the same bits the full
+        // expression gives): nearly every unmatched address row skips expf. A zero gives itself
+        // (+-0 / 2). The rest go through silu, and they take few values: the last one's result
+        // is kept
+        float *o = cv + c0;
+        int rest = 0;
+        for (int i = 0; i < n; i++) {
+            float x = tmp[i];
+            o[i] = x < -89.0f ? -0.0f : x;
+            rest |= x >= -89.0f && x != 0.0f;
+        }
+        if (rest) {
+            float lx = 0.0f, ly = 0.0f;
+            for (int i = 0; i < n; i++) {
+                float x = tmp[i];
+                if (x < -89.0f || x == 0.0f) continue;
+                if (x != lx) lx = x, ly = bf(silu(x));
+                o[i] = ly;
+            }
+        }
+    }
+}
+
 // Thread t's share of every layer. Each phase reads what the phase before wrote (through the
 // barrier) and writes only rows it owns.
 static void layers(Model *M, int t) {
@@ -524,74 +817,52 @@ static void layers(Model *M, int t) {
         Layer *L = &M->L[l];
         float *qkv = L->qkv, *z = L->z, *bb = L->bb, *aa = L->aa, *cv = L->cv, *y = L->y;
         // --- token mixer: Gated DeltaNet, for this thread's key heads
-        float rs = rms_scale(M);
-        matvec_n(M, &L->sub[QKV][t], L->in_norm, rs, qkv, acc);
-        matvec_n(M, &L->sub[Z][t], L->in_norm, rs, z, acc);
-        matvec_n(M, &L->sub[B][t], L->in_norm, rs, bb, acc);
-        matvec_n(M, &L->sub[A][t], L->in_norm, rs, aa, acc);
-        {  // causal_conv1d_update and silu, in bf16, segment by segment. The sum is torch's,
-           // ((s0 w0 + s1 w1) + s2 w2) + x w3, with the zero-weight terms left out: each is a
-           // zero (the states are finite; st_nonfinite counts any that is not), so leaving it out
-           // changes at most the sign of a zero sum. Only channels with a past tap keep a state.
+        float rs = rms_scale(M), *xn = c->xn;
+        for (int u = 0; u < L->nicol[t]; u++) xn[L->icol[t][u]] = normed(M, L->in_norm, rs, L->icol[t][u]);
+        matvec_n(&L->sub[A][t], xn, aa, acc);
+        // per key head, its query, key and value blocks of QKV and their conv: a block shown
+        // dead (Bound) is not computed; keys come from the last token's (their one tap), so they
+        // are dead now when the last token's were (kdead), and their state is kept only when
+        // this token's are not dead
+        char qdead[64], kprev[64];
+        {
             int C = 2 * NK * K + NV * K, T = M->tick;
             float *p3 = L->cs + (size_t)(T % 3) * C;        // 3 tokens ago, becomes this token's
             float *p2 = L->cs + (size_t)((T + 1) % 3) * C;  // 2 ago
             float *p1 = L->cs + (size_t)((T + 2) % 3) * C;  // 1 ago
-            float tmp[4096];
-            for (int k = 0; k < L->nseg[t]; k++) {
-                const float *w = L->cwt[t][k];
-                int mask = L->cmask[t][k];
-                for (int c0 = L->cc0[t][k], e = c0 + L->cn[t][k]; c0 < e; c0 += 4096) {
-                    int n = e - c0 < 4096 ? e - c0 : 4096;
-                    const float *q = qkv + c0;
-                    float *s3 = p3 + c0, *s2 = p2 + c0, *s1 = p1 + c0;
-                    switch (mask) {
-                    case 8:
-                        for (int i = 0; i < n; i++) tmp[i] = bf(q[i] * w[3]);
-                        break;
-                    case 4:
-                        for (int i = 0; i < n; i++) tmp[i] = bf(s1[i] * w[2]), s3[i] = q[i];
-                        break;
-                    case 9:
-                        for (int i = 0; i < n; i++) tmp[i] = bf(s3[i] * w[0] + q[i] * w[3]), s3[i] = q[i];
-                        break;
-                    case 10:
-                        for (int i = 0; i < n; i++) tmp[i] = bf(s2[i] * w[1] + q[i] * w[3]), s3[i] = q[i];
-                        break;
-                    default:
-                        for (int i = 0; i < n; i++)
-                            tmp[i] = bf(s3[i] * w[0] + s2[i] * w[1] + s1[i] * w[2] + q[i] * w[3]), s3[i] = q[i];
-                    }
-                    uint32_t top = 0;  // the largest |x| bits: inf or NaN is >= 0x7f800000
-                    for (int i = 0; i < n; i++) {
-                        uint32_t u;
-                        memcpy(&u, &q[i], 4);
-                        u &= 0x7fffffff;
-                        top = u > top ? u : top;
-                    }
-                    if (top >= 0x7f800000) atomic_fetch_add_explicit(&M->nonfinite, 1, memory_order_relaxed);
-                    // below -89, expf(-x) overflows to inf and x / inf is -0.0 (the same bits the
-                    // full expression gives): nearly every unmatched address row skips expf. A
-                    // zero gives itself (+-0 / 2). The rest go through silu, and they take few
-                    // values: the last one's result is kept
-                    float *o = cv + c0;
-                    int rest = 0;
-                    for (int i = 0; i < n; i++) {
-                        float x = tmp[i];
-                        o[i] = x < -89.0f ? -0.0f : x;
-                        rest |= x >= -89.0f && x != 0.0f;
-                    }
-                    if (rest) {
-                        float lx = 0.0f, ly = 0.0f;
-                        for (int i = 0; i < n; i++) {
-                            float x = tmp[i];
-                            if (x < -89.0f || x == 0.0f) continue;
-                            if (x != lx) lx = x, ly = bf(silu(x));
-                            o[i] = ly;
-                        }
-                    }
+            for (int hh = 0; hh < L->nh[t]; hh++) {
+                int j = L->heads[t][hh];
+                int qd = bound_dead(&L->bnd[j], xn);
+                int kp = L->kdead[j], kd = bound_dead(&L->bnd[NK + j], xn);
+                qdead[j] = (char)qd, kprev[j] = (char)kp, L->kdead[j] = (char)kd;
+                // queries (and the gates of the output) when they can be nonzero
+                if (!qd) {
+                    matvec_n(&L->qb[j], xn, qkv, acc);
+                    matvec_n(&L->zh[j], xn, z, acc);
                 }
+                for (int k = L->sg0[j]; k < L->sg0[j + 1]; k++)
+                    if (!qd) conv_seg(M, L, k, qkv, cv, p3, p2, p1, 1, 1);
+                // keys: made (and kept as the conv state) when this token's can be nonzero, their
+                // conv (of the last token's) when the last token's could
+                if (!kd) matvec_n(&L->qb[NK + j], xn, qkv, acc);
+                for (int k = L->sg0[NK + j]; k < L->sg0[NK + j + 1]; k++)
+                    conv_seg(M, L, k, qkv, cv, p3, p2, p1, !kp, !kd);
+                if (kp) continue;
+                // the head can write: its betas, and its values, now and (from the kept inputs) at
+                // the 3 tokens before, for the conv
+                int g = 2 * NK + j, ni = L->nicol[t];
+                matvec_n(&L->bh[j], xn, bb, acc);
+                matvec_n(&L->qb[g], xn, qkv, acc);
+                for (int a = 1; a <= 3; a++) {
+                    const float *xs = L->xh[t] + (size_t)((T + 3 - a) % 3) * ni;
+                    for (int u = 0; u < ni; u++) c->xp[L->icol[t][u]] = xs[u];
+                    matvec_n(&L->qb[g], c->xp, c->past[a - 1], acc);
+                }
+                for (int k = L->sg0[g]; k < L->sg0[g + 1]; k++)
+                    conv_seg(M, L, k, qkv, cv, c->past[2], c->past[1], c->past[0], 1, 0);
             }
+            float *xs = L->xh[t] + (size_t)(T % 3) * L->nicol[t];  // this token's, for later
+            for (int u = 0; u < L->nicol[t]; u++) xs[u] = xn[L->icol[t][u]];
         }
         // per key head: the l2-normed key and query (shared by its r value heads)
         for (int hh = 0; hh < L->nh[t]; hh++) {
@@ -600,11 +871,16 @@ static void layers(Model *M, int t) {
             int32_t ki[K], qi[K];
             int nk = 0, nq = 0;
             float kss = 0.0f, qss = 0.0f, kf[K], qf[K];
-            for (int i = 0; i < K; i++) {
-                kss += k[i] * k[i], qss += q[i] * q[i];
-                if (k[i] != 0.0f) ki[nk++] = i;
-                if (q[i] != 0.0f) qi[nq++] = i;
-            }
+            if (!kprev[j])  // (a dead block's values are all -0: none nonzero)
+                for (int i = 0; i < K; i++) {
+                    kss += k[i] * k[i];
+                    if (k[i] != 0.0f) ki[nk++] = i;
+                }
+            if (!qdead[j])
+                for (int i = 0; i < K; i++) {
+                    qss += q[i] * q[i];
+                    if (q[i] != 0.0f) qi[nq++] = i;
+                }
             float kn = 1.0f / sqrtf(kss + 1e-6f), qn = 1.0f / sqrtf(qss + 1e-6f);
             for (int u = 0; u < nk; u++) kf[ki[u]] = k[ki[u]] * kn;
             for (int u = 0; u < nq; u++) qf[qi[u]] = (q[qi[u]] * qn) / 11.313708498984761f;
@@ -676,8 +952,9 @@ static void layers(Model *M, int t) {
         // --- MLP: gate and up for this thread's units
         rs = rms_scale(M);
         const Mat *mg = &L->sub[GATE][t];
-        matvec_n(M, mg, L->post_norm, rs, L->g, acc);
-        matvec_n(M, &L->sub[UP][t], L->post_norm, rs, L->u, acc);
+        for (int u = 0; u < L->npcol[t]; u++) xn[L->pcol[t][u]] = normed(M, L->post_norm, rs, L->pcol[t][u]);
+        matvec_n(mg, xn, L->g, acc);
+        matvec_n(&L->sub[UP][t], xn, L->u, acc);
         int nm = 0;
         int32_t *ml = L->ml + L->fstart[t];
         for (int u = 0; u < mg->nlive; u++) {

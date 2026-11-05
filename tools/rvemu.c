@@ -7,6 +7,7 @@
 // machine's memory as the host will read it from the model's state.
 //
 //   rvemu doom.elf [-frames N] [-shot K out.ppm] [-vbuf ADDR -pal ADDR] [-q] [-stop N]
+//                  [-touch out.bin]
 //
 // prints the program's output (FRAME_MARK bytes left out), then the instruction count at every
 // frame (-q: only the totals). -stop N: after N instructions, the PC, registers and a RAM hash.
@@ -32,10 +33,21 @@ static void fault(const char *why, uint32_t a) {
     exit(2);
 }
 
+// -touch: every RAM and DROM word the program reads or writes, one byte each (RAM's words, then
+// the DROM's), written at exit
+static const char *touch_path;
+static uint8_t ram_t[RAM_SIZE / 4], drom_t[DROM_SIZE / 4];
+static void touch_write(void) {
+    FILE *f = touch_path ? fopen(touch_path, "wb") : NULL;
+    if (!f) return;
+    fwrite(ram_t, 1, sizeof ram_t, f), fwrite(drom_t, 1, sizeof drom_t, f), fclose(f);
+}
+
 static uint8_t *mem(uint32_t a, int n, int store) {
     if (a & (n - 1)) fault(store ? "misaligned store" : "misaligned load", a);
-    if (a + n <= RAM_SIZE) return ram + a;
-    if (!store && a >= DROM_BASE && a + n <= DROM_BASE + DROM_SIZE) return drom + (a - DROM_BASE);
+    if (a + n <= RAM_SIZE) return ram_t[a >> 2] = 1, ram + a;
+    if (!store && a >= DROM_BASE && a + n <= DROM_BASE + DROM_SIZE)
+        return drom_t[(a - DROM_BASE) >> 2] = 1, drom + (a - DROM_BASE);
     fault(store ? "store out of range" : "load out of range", a);
     return NULL;
 }
@@ -90,7 +102,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-pal")) pal = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-q")) quiet = 1;
         else if (!strcmp(argv[i], "-stop")) stop = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-touch")) touch_path = argv[++i];
     }
+    atexit(touch_write);
     load_elf(argv[1]);
     x[2] = RAM_SIZE;  // sp: the host sets it at the top of RAM
     long frame = 0;
