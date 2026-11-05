@@ -102,6 +102,12 @@ typedef struct {
     // this token from its inputs, and the past ones its conv reads from the inputs of the tokens
     // before, kept here: thread t's normed inputs (its icol) of token T in xh[t] + (T % 3) * nicol
     float *xh[NT];
+    // the whole layer's queries and keys as two blocks: when no query can be nonzero, no key was
+    // last token (lkd, each thread's copy), the state does not decay and there is no MLP, the
+    // layer reads and writes nothing and leaves the residual as it is: skip_ok
+    Bound lq, lk;
+    int skip_ok, lkd[NT];
+    int in_id, post_id;  // the norms' weights, numbered by their values
     char *kdead;  // key head j's keys were all shown below -100 at the last token (so its keys
                   // now, the conv of those, are all -0 and the conv state was not kept for them)
     float *qkv, *z, *bb, *aa, *cv, *y, *o, *g, *u, *mm, *dn;  // stay 0 outside live outputs
@@ -113,7 +119,9 @@ typedef struct {
 } Layer;
 
 typedef struct {  // a thread's own buffers
-    float *acc, *xn, *xp, *past[3];  // xp: a past token's normed inputs; past: its QKV values
+    float *acc, *xn, *xp, *past[3];
+    uint64_t *xs, hv, rv;  // xs[i]: the key xn[i] was made for; hv: the residual's version; rv:
+    float rs;              // the version rs (the norm's scale) is of  // xp: a past token's normed inputs; past: its QKV values
     int32_t *li;
     int sense;
 } Ctx;
@@ -128,9 +136,14 @@ typedef struct {
     int32_t *code;     // the code dims (the only dims the final norm keeps)
     int32_t *hptr, *hrow;  // output head: per code dim, the tokens with an entry there
     float *hval;
+    int32_t *tptr, *tc;    // and per token, its entries (code dim, value), in the code dims' order
+    float *tv;
+    float *hlo[NT], *hhi[NT];  // per thread, per block of HB tokens, per code dim: see head_range
     float *logits, *h;
     uint64_t *hz;      // the residual's nonzero dims
     Ctx cx[NT];
+    const float *norms[256];  // the distinct norm weights (by value)
+    int nnorms;
     float hx[64];
     // the threads: a token starts when gen moves; done counts the workers finished
     int head, tick;    // tick: tokens since the reset (picks the conv state planes)
@@ -345,8 +358,8 @@ static void bound_init(Bound *b, const Mat *m, int ok) {
         if (k == 2) two[c] = 1;
         if (k == 3) many++, cb = c;
     }
-    if (nr <= 1024 && nc <= 1024) {  // the groups of two-valued columns
-        uint64_t (*sig)[16] = calloc(nc + 1, sizeof *sig);
+    if (nr <= 4096 && nc <= 1024) {  // the groups of two-valued columns
+        uint64_t (*sig)[64] = calloc(nc + 1, sizeof *sig);
         for (int j = 0; j < nc; j++) {
             if (!two[j]) continue;
             for (int r = 0; r < nr; r++)
@@ -367,7 +380,7 @@ static void bound_init(Bound *b, const Mat *m, int ok) {
         }
         free(sig);
     }
-    if (many == 1 && nr > 1 && nr <= 1024 && nc <= 1024) {
+    if (many == 1 && nr > 1 && nr <= 4096 && nc <= 1024) {
         // fit bias = c + sum_j dhi_j [row hi at j] over the groups' first columns, then check
         // every row
         double *d = calloc(nc + 1, sizeof(double)), mean = 0;
@@ -458,6 +471,7 @@ Model *st_new(int nl, int D, int F, int NK, int NV, int vocab) {
         Ctx *c = &M->cx[t];
         c->acc = calloc(big, sizeof(float)), c->li = malloc(sizeof(int32_t) * big);
         c->xn = calloc(D, sizeof(float)), c->xp = calloc(D, sizeof(float));
+        c->xs = calloc(D, sizeof(uint64_t)), c->hv = 1, c->rv = 0;
         for (int k = 0; k < 3; k++) c->past[k] = calloc(2 * NK * K + NV * K, sizeof(float));
     }
     return M;
@@ -619,9 +633,37 @@ void st_layer(Model *M, int layer, const float *conv, const float *A_log, const 
         }
     }
     L->nomlp = L->m[GATE].nlive == 0 && L->m[UP].nlive == 0 && L->m[DOWN].nlive == 0;
+    {  // the layer's query and key blocks
+        int okq = 1, okk = 1;
+        for (int j = 0; j < NK; j++) okq &= L->bnd[j].ok, okk &= L->bnd[NK + j].ok;
+        for (int b = 0; b < 2; b++) {
+            for (int c = 0; c < C; c++) own[c] = (char)(c < QK ? 0 : c < 2 * QK ? 1 : 2);
+            Mat m;
+            memset(&m, 0, sizeof m);
+            const Mat *f = &L->m[QKV];
+            mat_init(&m, f->nin, f->nout, f->colptr, f->rows, f->vals, own, b);
+            mat_compact(&m);
+            bound_init(b ? &L->lk : &L->lq, &m, b ? okk : okq);
+            free(m.live), mat_free_runs(&m);
+        }
+        L->skip_ok = !L->decays && L->nomlp && L->lq.ok && L->lk.ok;
+        for (int t = 0; t < NT; t++) L->lkd[t] = 0;
+        const float *nw[2] = {in_norm, post_norm};
+        int id[2];
+        for (int k = 0; k < 2; k++) {
+            id[k] = -1;
+            for (int i = 0; i < M->nnorms && id[k] < 0; i++)
+                if (!memcmp(M->norms[i], nw[k], sizeof(float) * D)) id[k] = i;
+            if (id[k] < 0 && M->nnorms < 256) id[k] = M->nnorms, M->norms[M->nnorms++] = nw[k];
+            if (id[k] < 0) id[k] = 255;  // (more than 255 distinct: these are never reused)
+        }
+        L->in_id = id[0], L->post_id = id[1];
+    }
     for (int t = 0; t < NT; t++) {  // the inputs each thread's products read
         char *in = calloc(D, 1), *post = calloc(D, 1);
         for (int c = 0; c < L->sub[A][t].ncol; c++) in[L->sub[A][t].col[c]] = 1;
+        for (int c = 0; c < L->lq.n; c++) in[L->lq.col[c]] = 1;  // (every thread tests the layer)
+        for (int c = 0; c < L->lk.n; c++) in[L->lk.col[c]] = 1;
         for (int hh = 0; hh < L->nh[t]; hh++) {
             int j = L->heads[t][hh];
             const Mat *ms[5] = {&L->qb[j], &L->qb[NK + j], &L->qb[2 * NK + j], &L->zh[j], &L->bh[j]};
@@ -714,27 +756,51 @@ void st_reset(Model *M) {
 
 // --- the output head: logits over the vocabulary from the code dims, in NT token ranges -------
 
+// Thread t's range of the vocabulary, in blocks of HB tokens; a block's least and greatest entry
+// per code dim (0 among them where a token has none) bound each token's logit from above, as the
+// layers' blocks do. A block is scored only if its bound could reach the best logit found so far:
+// a token's float sum of n terms is within (n + 1) u sum|terms| of the exact one, and a value more
+// than one bf16 step (|v| 2^-7) below the best rounds below it, so a block whose bound plus that
+// is under best - |best| 2^-7 holds no token that is the best or ties it. Of the tokens scored,
+// the best bf16 logit wins, the first on ties: the same token the full argmax picks.
+#define HB 64
+static float tok_logit(const Model *M, int v) {
+    float lg = 0.0f;  // the terms in the code dims' order, as head_range's sum over columns
+    for (int p = M->tptr[v]; p < M->tptr[v + 1]; p++) {
+        float xv = M->hx[M->tc[p]];
+        if (xv != 0.0f) lg += M->tv[p] * xv;
+    }
+    return bf(lg);
+}
+
 static void head_range(Model *M, int t) {
     int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
-    float *lg = M->logits;
-    memset(lg + v0, 0, sizeof(float) * (v1 - v0));
-    for (int c = 0; c < M->ncode; c++) {  // the code dims in ascending order, as the sum's terms
-        float xv = M->hx[c];
-        if (xv == 0.0f) continue;
-        // this column's entries are sorted by token: find range [v0, v1)
-        int lo = M->hptr[c], hi = M->hptr[c + 1];
-        while (lo < hi) {
-            int mid = (lo + hi) / 2;
-            if (M->hrow[mid] < v0) lo = mid + 1; else hi = mid;
+    int nb = (v1 - v0 + HB - 1) / HB, nc = M->ncode;
+    const float *lo = M->hlo[t], *hi = M->hhi[t];
+    double ub[(230336 / NT) / HB + 2], *u = nb + 2 <= (int)(sizeof ub / sizeof *ub) ? ub : malloc(sizeof(double) * nb);
+    int first = 0;
+    for (int k = 0; k < nb; k++) {
+        double s = 0, a = 0;
+        for (int c = 0; c < nc; c++) {
+            double x = M->hx[c], p = lo[(size_t)k * nc + c] * x, q = hi[(size_t)k * nc + c] * x;
+            s += p > q ? p : q, a += fabs(p) > fabs(q) ? fabs(p) : fabs(q);
         }
-        for (int p = lo; p < M->hptr[c + 1] && M->hrow[p] < v1; p++) lg[M->hrow[p]] += M->hval[p] * xv;
+        u[k] = s + a * ((nc + 2) * 0x1p-24) + 1e-30;
+        if (u[k] > u[first]) first = k;
     }
-    int best = v0;
-    float bv = bf(lg[v0]);
-    for (int v = v0 + 1; v < v1; v++) {
-        float b = bf(lg[v]);
-        if (b > bv) bv = b, best = v;
-    }
+    int best = -1;
+    float bv = -INFINITY;
+    for (int pass = 0; pass < 2; pass++)  // the most promising block, then the rest
+        for (int k = pass ? 0 : first; k < (pass ? nb : first + 1); k++) {
+            if (pass && k == first) continue;
+            double cut = (double)bv - fabs((double)bv) * 0x1p-7 - 1e-36;
+            if (best >= 0 && u[k] < cut) continue;
+            for (int v = v0 + k * HB, e = v + HB < v1 ? v + HB : v1; v < e; v++) {
+                float b = tok_logit(M, v);
+                if (b > bv || (b == bv && v < best)) bv = b, best = v;
+            }
+        }
+    if (u != ub) free(u);
     M->bv[t] = bv, M->best[t] = best;
 }
 
@@ -813,12 +879,42 @@ static void layers(Model *M, int t) {
     float *h = M->h, *acc = c->acc;
     int32_t *li = c->li;
     int NK = M->NK, NV = M->NV, r = NV / NK, QK = NK * K;
+    c->hv++;  // (a new token: a new residual)
     for (int l = 0; l < M->nl; l++) {
         Layer *L = &M->L[l];
         float *qkv = L->qkv, *z = L->z, *bb = L->bb, *aa = L->aa, *cv = L->cv, *y = L->y;
-        // --- token mixer: Gated DeltaNet, for this thread's key heads
-        float rs = rms_scale(M), *xn = c->xn;
-        for (int u = 0; u < L->nicol[t]; u++) xn[L->icol[t][u]] = normed(M, L->in_norm, rs, L->icol[t][u]);
+        // --- token mixer: Gated DeltaNet, for this thread's key heads. The norm's scale and the
+        // normed inputs are made again only when the residual (or the norm's weights) changed
+        if (c->rv != c->hv) c->rs = rms_scale(M), c->rv = c->hv;
+        float rs = c->rs, *xn = c->xn;
+        uint64_t key = c->hv << 8 | (uint64_t)L->in_id;
+        for (int u = 0; u < L->nicol[t]; u++) {
+            int i = L->icol[t][u];
+            if (c->xs[i] != key || L->in_id == 255) xn[i] = normed(M, L->in_norm, rs, i), c->xs[i] = key;
+        }
+        {
+            int lq = bound_dead(&L->lq, xn), lk = bound_dead(&L->lk, xn), lkp = L->lkd[t];
+            L->lkd[t] = lk;
+            if (L->skip_ok && lq && lkp) {
+                // no query can be nonzero and no key was: nothing is read or written. Only the
+                // keys that can be nonzero now are made (and kept, for the next token), and the
+                // inputs kept for the values; the residual is left as it is (every thread takes
+                // this same way, from the same inputs, so no barrier)
+                int C = 2 * NK * K + NV * K, T = M->tick;
+                float *p3 = L->cs + (size_t)(T % 3) * C;
+                for (int hh = 0; hh < L->nh[t]; hh++) {
+                    int j = L->heads[t][hh], kd = lk || bound_dead(&L->bnd[NK + j], xn);
+                    L->kdead[j] = (char)kd;
+                    if (kd) continue;
+                    matvec_n(&L->qb[NK + j], xn, qkv, acc);
+                    for (int k = L->sg0[NK + j]; k < L->sg0[NK + j + 1]; k++)
+                        conv_seg(M, L, k, qkv, cv, p3, p3, p3, 0, 1);  // (keep only: no tap read)
+                }
+                float *xs = L->xh[t] + (size_t)(T % 3) * L->nicol[t];
+                for (int u = 0; u < L->nicol[t]; u++) xs[u] = xn[L->icol[t][u]];
+                continue;
+            }
+        }
         matvec_n(&L->sub[A][t], xn, aa, acc);
         // per key head, its query, key and value blocks of QKV and their conv: a block shown
         // dead (Bound) is not computed; keys come from the last token's (their one tap), so they
@@ -948,6 +1044,7 @@ static void layers(Model *M, int t) {
             h[i] = bf(h[i] + L->o[i]), hz_set(M, i, h[i]);
         }
         bar(M, c);
+        c->hv++;
         if (L->nomlp) continue;  // (a layer whose MLP is empty leaves the residual as it is)
         // --- MLP: gate and up for this thread's units
         rs = rms_scale(M);
@@ -975,6 +1072,7 @@ static void layers(Model *M, int t) {
             h[i] = bf(h[i] + L->dn[i]), hz_set(M, i, h[i]);
         }
         bar(M, c);
+        c->hv++;
     }
 }
 
@@ -1023,7 +1121,34 @@ void st_embed(Model *M, const int32_t *erow, const int32_t *ecol, const float *e
             int q = M->hptr[c] + fill[c]++;
             M->hrow[q] = t, M->hval[q] = eval[p];
         }
-    free(fill), free(slot);
+    free(fill);
+    M->tptr = calloc(M->vocab + 1, sizeof(int32_t));
+    for (int v = 0; v < M->vocab; v++) {
+        int n = 0;
+        for (int p = erow[v]; p < erow[v + 1]; p++) n += slot[ecol[p]] >= 0;
+        M->tptr[v + 1] = M->tptr[v] + n;
+    }
+    M->tc = malloc(sizeof(int32_t) * (M->tptr[M->vocab] + 1)), M->tv = malloc(sizeof(float) * (M->tptr[M->vocab] + 1));
+    for (int v = 0; v < M->vocab; v++) {
+        int q = M->tptr[v];
+        for (int c = 0; c < ncode; c++)  // (in the code dims' order)
+            for (int p = erow[v]; p < erow[v + 1]; p++)
+                if (slot[ecol[p]] == c) M->tc[q] = c, M->tv[q] = eval[p], q++;
+    }
+    for (int t = 0; t < NT; t++) {
+        int v0 = (int)((long)t * M->vocab / NT), v1 = (int)((long)(t + 1) * M->vocab / NT);
+        int nb = (v1 - v0 + HB - 1) / HB;
+        M->hlo[t] = malloc(sizeof(float) * ((size_t)nb * ncode + 1)), M->hhi[t] = malloc(sizeof(float) * ((size_t)nb * ncode + 1));
+        for (int k = 0; k < nb; k++)
+            for (int c = 0; c < ncode; c++) {
+                float lo = 0.0f, hi = 0.0f;  // (0: a token with no entry at c)
+                for (int v = v0 + k * HB, e = v + HB < v1 ? v + HB : v1; v < e; v++)
+                    for (int p = M->tptr[v]; p < M->tptr[v + 1]; p++)
+                        if (M->tc[p] == c) lo = M->tv[p] < lo ? M->tv[p] : lo, hi = M->tv[p] > hi ? M->tv[p] : hi;
+                M->hlo[t][(size_t)k * ncode + c] = lo, M->hhi[t][(size_t)k * ncode + c] = hi;
+            }
+    }
+    free(slot);
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (int t = 1; t < NT; t++) {
         Arg *a = malloc(sizeof(Arg));
