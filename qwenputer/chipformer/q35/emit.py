@@ -185,8 +185,12 @@ def clearable_dims(g: Graph, traces: list[list[int]]) -> set[int]:
 
 
 def emit_layers(g: Graph, lay: Layout, tc: dict, first: int, prefix: str,
-                alloc: Alloc | None = None, keep: set[int] | None = None) -> dict:
+                alloc: Alloc | None = None, keep: set[int] | None = None, sink=None) -> dict:
     """Weights of the chip layers, named ``{prefix}layers.{first + i}.*``.
+
+    (qwendoom) With ``sink``, each layer goes to ``sink(index, {name: tensor})`` as soon as it
+    is made, instead of into the returned dict, so a circuit of hundreds of layers never has
+    them all in memory.
 
     With ``keep``, the MLP sublayer of the nodes named ``exit.*`` also clears every chip dim
     except ``keep`` (and the ballast), so nothing of the circuit is left for later layers.
@@ -282,6 +286,10 @@ def emit_layers(g: Graph, lay: Layout, tc: dict, first: int, prefix: str,
         }
         for k, t in layer.items():
             check_bf16(p + k, t)
+        if sink is not None:
+            sink(first + L, layer)
+            continue
+        for k, t in layer.items():
             out[p + k] = t
     return out
 

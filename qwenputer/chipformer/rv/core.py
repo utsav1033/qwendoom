@@ -300,6 +300,7 @@ def build(target: Target | None = None, text=None) -> RvCore:
     """The circuit; with ``text`` (P3) also the bridge to Qwen's text: a tool call's text goes
     into a buffer the program reads (TEXT_ADDR), ``</tool_call>`` starts a run (GO), putchar
     output is echoed as Qwen tokens, and the circuit owns the positions of a run."""
+    assert not text or S.MAP != "doom", "(qwendoom) the text bridge is P2's map only"
     c = RvCore(target, text)
     no_text = c.is_text if text else 0  # text tokens do not count as tokens of a record
     one, fam, pay, kk = c.one, c.fam, c.pay, c.kk
@@ -372,9 +373,15 @@ def build(target: Target | None = None, text=None) -> RvCore:
 
     w = add_small(anchor, 0, 16, "w")
     w1 = add_small(anchor, 1, 17, "w+1")  # the link: PC + 4 = ROM_BASE + 4 * (w + 1)
-    assert S.ROM_BASE == 1 << 18 and S.ROM_WORDS == 1 << 16
-    pc_bits = [Expr(), Expr()] + w + [one] + [Expr()] * 13  # PC = 0x40000 + 4 w
-    link = [Expr()] * 2 + w1[:16] + [one - w1[16], w1[16]] + [Expr()] * 12
+    # (qwendoom) ROM_BASE = 2^rb, rb >= 18: P2's 0x40000 (rb = 18) or the Doom map's 0x2000000
+    rb = S.ROM_BASE.bit_length() - 1
+    assert S.ROM_BASE == 1 << rb and rb >= 18 and S.ROM_WORDS == 1 << 16
+    pc_bits = [Expr(), Expr()] + w + [Expr()] * (rb - 18) + [one] + [Expr()] * (31 - rb)
+    if rb == 18:  # PC = ROM_BASE + 4 w
+        link = [Expr()] * 2 + w1[:16] + [one - w1[16], w1[16]] + [Expr()] * 12
+    else:  # w + 1's carry lands on bit 18, below the base's bit
+        link = ([Expr()] * 2 + w1[:16] + [w1[16]] + [Expr()] * (rb - 19) + [one]
+                + [Expr()] * (31 - rb))
     # digits so far: nd = j - 1 - v inside a DIV record (QS at j = 0, then the digits)
     nd_int = sum(jt, Expr()) - 1 - sum(vt, Expr())
     nd_is = {v: c.node(c.t_eq(nd_int, v, -4, JMAX), f"nd=={v}") for v in range(1, 9)}
@@ -857,9 +864,13 @@ def build(target: Target | None = None, text=None) -> RvCore:
     # ---------------------------------------------------------------- L9: DROM
     # word index wi = EA[16:2] (DROM at 0x20000): key head wi[14:11] = EA[16:13], value head
     # wi[10] = EA[12], row pair (p, p + 64) with p = EA[11:6], half EA[5], word EA[4:2]
+    # (qwendoom: the key head is EA[13:13 + log2(heads)], so 2^dh heads hold 2^(13 + dh) bytes)
     ddims = c.zeros(4, "drom.b")
-    for h in range(S.DROM_WORDS >> 11):
-        hl = lits_of(EA[13:17], h)
+    n_drom_heads = S.DROM_WORDS >> 11
+    dh = n_drom_heads.bit_length() - 1
+    assert n_drom_heads == 1 << dh
+    for h in range(n_drom_heads):
+        hl = lits_of(EA[13:13 + dh], h)
         q = {}
         for p in range(64):
             e = andpre(lits_of(EA[6:12], p) + hl)
@@ -906,8 +917,12 @@ def build(target: Target | None = None, text=None) -> RvCore:
 
     # ---------------------------------------------------------------- loads, merge, compares
     lane = EA[0:2]
-    in_ram = c.and_([1 - b for b in EA[15:32]], "in_ram")
-    in_drom = c.and_([1 - b for b in EA[18:32]] + [EA[17]], "in_drom")
+    # (qwendoom) RAM at 0 of 2^ra bytes; the DROM's 2^ds bytes at 2^db (P2: ra 15, ds 17, db 17)
+    ra, ds, db = (4 * S.RAM_WORDS).bit_length() - 1, (4 * S.DROM_WORDS).bit_length() - 1, \
+        S.DROM_BASE.bit_length() - 1
+    assert S.RAM_BASE == 0 and 4 * S.RAM_WORDS == 1 << ra and S.DROM_BASE == 1 << db and ds <= db
+    in_ram = c.and_([1 - b for b in EA[ra:32]], "in_ram")
+    in_drom = c.and_([1 - b for b in EA[ds:db] + EA[db + 1:32]] + [EA[db]], "in_drom")
     in_text = (c.and_(tsel + [1 - b for b in EA[16:32]], "in_text") if text else None)
     ld = []
     for i in range(32):
@@ -983,8 +998,9 @@ def build(target: Target | None = None, text=None) -> RvCore:
     oor_st = c.node(c.t_and([is_store, 1 - mis_st])
                     + c.t_and([is_store, 1 - mis_st, in_ram], -1), "fault.oorst")
     jalr = uops["JALR"]
-    # a bad JALR target (EA & ~1): misaligned, or outside the ROM (EA[31:19] = 0, EA[18] = 1)
-    rom_ok = [1 - b for b in EA[19:32]] + [EA[18]]
+    # a bad JALR target (EA & ~1): misaligned, or outside the ROM (EA[31:19] = 0, EA[18] = 1;
+    # qwendoom: EA[17 + 1:rb] = 0, EA[rb] = 1, EA[rb + 1:] = 0 for ROM_BASE = 2^rb)
+    rom_ok = [1 - b for b in EA[18:rb] + EA[rb + 1:32]] + [EA[rb]]
     fc6_terms = (c.t_and([jalr, EA[1]]) + c.t_and([jalr, 1 - EA[1]])
                  + c.t_and([jalr, 1 - EA[1]] + rom_ok, -1) + c.t_and([uops["JAL"], jbad]))
     fc = {0: c.and_([uops["ILLEGAL"]], "fault.0"), 1: c.and_([uops["EBREAK"]], "fault.1"),
@@ -1257,16 +1273,15 @@ def snapshot(c: RvCore, m: "RF.Machine") -> None:
                     rows[r] = row
                 vh.append(rows)
             c.tables[f"bn{port}.{h}"].init = vh
-    for h in range(S.RAM_WORDS >> 8):
-        r0, r1 = {}, {}
-        for wi in range(S.RAM_WORDS):
-            if (wi & 15 | (wi >> 12) << 4) != h or not m.ram[wi]:
-                continue
-            row = np.zeros(HD)
-            row[list(REF_COLS)] = A_REF
-            for i in range(32):
-                row[2 + i] = A_BIT * (m.ram[wi] >> i & 1)
-            (r1 if wi >> 4 & 1 else r0)[wi >> 5 & 127] = row
+    # (qwendoom) one pass over the nonzero words: a word's head is wi[3:0] | wi[:12] << 4
+    ram = [[{}, {}] for _ in range(S.RAM_WORDS >> 8)]
+    for wi in (i for i, v in enumerate(m.ram) if v):
+        row = np.zeros(HD)
+        row[list(REF_COLS)] = A_REF
+        for i in range(32):
+            row[2 + i] = A_BIT * (m.ram[wi] >> i & 1)
+        ram[wi & 15 | (wi >> 12) << 4][wi >> 4 & 1][wi >> 5 & 127] = row
+    for h, (r0, r1) in enumerate(ram):
         c.tables[f"ram{h}"].init = [r0, r1]
 
 
