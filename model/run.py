@@ -127,7 +127,8 @@ def main():
     st = Stepper()
     mem = Memory(st)
     sym = symbols(args.elf)
-    vbuf, pal, gamma = sym["I_VideoBuffer"], sym["qd_palette"], gamma0()
+    vbuf, pal = sym.get("I_VideoBuffer"), sym.get("qd_palette")  # (Doom's; other programs draw no frames)
+    gamma = gamma0() if vbuf else None
     latest = d / "latest.json"
     if latest.exists():
         slot = json.loads(latest.read_text())["slot"]
