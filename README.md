@@ -149,6 +149,50 @@ The boot took 4 h 28 min (63.05M tokens, 36.37M instructions). Then the first 40
 frames are cheap, since Doom only slides columns of the old screen down. Frame 39 is the first
 clean frame of the level.
 
+### Nov 6–7: the model compiles and runs C
+
+Same model, same weights, a different program in its memory:
+[c4](https://github.com/rswier/c4), a C compiler in about 500 lines. c4 compiles C to code for
+its own small stack VM and then runs it, so one program does both. It can compile itself.
+
+`mandel.c` draws the Mandelbrot set in text. c4 has no floats, so it uses fixed point
+(4096 = 1.0). The model ran c4, c4 compiled `mandel.c` and ran it, and the model printed this
+one row at a time:
+
+```
+          ..............::::::-+@=-:::..
+         .............::::::--@@@@=:::::
+         ...........:::::*+=++#@@@+*--+:
+        .........::::::--+@@@@@@@@@@@@@-
+        ......::--------*@@@@@@@@@@@@@@-
+       ...:::::--@@*@@++@@@@@@@@@@@@@@@*
+       .:::::::-+@@@@@@%@@@@@@@@@@@@@@@+
+       ::-----+@@@@@@@@@@@@@@@@@@@@@@@@-
+       ::-----+@@@@@@@@@@@@@@@@@@@@@@@@-
+       .:::::::-+@@@@@@%@@@@@@@@@@@@@@@+
+       ...:::::--@@*@@++@@@@@@@@@@@@@@@*
+        ......::--------*@@@@@@@@@@@@@@-
+        .........::::::--+@@@@@@@@@@@@@-
+         ...........:::::*+=++#@@@+*--+:
+         .............::::::--@@@@=:::::
+          ..............::::::-+@=-:::..
+exit(0) cycle = 316370
+```
+
+7,254,293 tokens (4.97M instructions) in 29 minutes on a MacBook CPU, every token equal to the
+reference CPU's, the output identical to the emulator's. c4 needs about 1.25 MB of buffers, so
+it doesn't fit the stock 32 KB machine either.
+
+Two changes made it 34% cheaper, with the same output for every test program:
+`c4/c4-fuse.patch` fuses c4's commonest VM op pairs after compiling (load a local, push a
+constant), and c4's 768 KB of startup zeroing uses an unrolled memset.
+
+| program, in the emulator | stock c4 | now |
+|---|---:|---:|
+| `hello.c` | 795K instructions | 255K |
+| `mandel.c` | 7.57M | 4.97M |
+| c4 compiling c4, which compiles `hello.c` | 3.82M | 3.00M |
+
 ---
 
 ## What's done, what's not
@@ -160,6 +204,7 @@ clean frame of the level.
 | ✅ The model runs Doom's boot | every token so far equal to the reference CPU's |
 | ✅ Reading memory back out of the model | equal to the reference machine's RAM |
 | ✅ Frames drawn by the model | 41 so far, 0 pixels different from the emulator (the run is paused, resumable) |
+| ✅ A C compiler on the model | c4 compiled and ran `mandel.c`: 7.25M tokens, all equal, same output as the emulator |
 | ⏳ Faster | ~270 µs per token now: about a third is the RISC-V CPU's own circuit, the rest overhead |
 
 ![Every token checked: 76.2M tokens, 0 mismatches, 41 frames 0 pixels off](docs/img/verified.png)
@@ -188,6 +233,14 @@ QWENPUTER_MAP=doom PYTHONPATH=qwenputer python model/stepper.py port/build/doom.
 QWENPUTER_MAP=doom PYTHONPATH=qwenputer python model/run.py port/build/doom.elf   # the long run
 ```
 
+c4 (after the model is packed):
+
+```bash
+c4/build.sh mandel '"c4", "mandel.c"'          # c4 for the machine, running mandel.c from its ROM disk
+tools/build/rvemu c4/build/c4-mandel.elf       # in the emulator
+QWENPUTER_MAP=doom PYTHONPATH=qwenputer python model/run.py c4/build/c4-mandel.elf --dir model/build/c4-mandel
+```
+
 ## What's in the repo
 
 | | |
@@ -199,6 +252,7 @@ QWENPUTER_MAP=doom PYTHONPATH=qwenputer python model/run.py port/build/doom.elf 
 | `model/pack.py` | builds the model and keeps its nonzero weights |
 | `model/stepper.c` | runs the model, one token at a time, exactly (the speed is here) |
 | `model/run.py` | the long run: every token checked, checkpoints, frames |
+| `c4/` | c4 for the machine: a ROM disk of C sources, the op-fusion patch, test programs |
 
 <details>
 <summary><b>The stepper's tricks, in detail</b></summary>
@@ -243,6 +297,7 @@ error plus one bf16 step; ties go to the lowest token number, as in the full arg
 - [Qwenputer](https://github.com/divagr18/qwenputer) by Divyansh Agrawal, MIT (`qwenputer/LICENSE`).
 - [doomgeneric](https://github.com/ozkl/doomgeneric) by ozkl, GPL-2.0. Fetched at a pinned commit, not included.
 - [Freedoom](https://freedoom.github.io), BSD. Downloaded, not included.
+- [c4](https://github.com/rswier/c4) by Robert Swierczek, GPL-2.0. Fetched at a pinned commit, not included.
 - [qwenGPU](https://github.com/vixhal-baraiya/qwenGPU) by vixhal-baraiya, where this started.
 - The stepper idea is the same as [Locals](https://github.com/Generated-Computers/Locals)' stepper for Qwenputer.
-- Everything else here (`port/`, `tools/`, `model/`) is GPL-2.0, because the port links doomgeneric (`LICENSE`).
+- Everything else here (`port/`, `tools/`, `model/`, `c4/`) is GPL-2.0, because the port links doomgeneric (`LICENSE`).
