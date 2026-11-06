@@ -26,8 +26,10 @@ CFLAGS=("${TARGET[@]}" -O2 -w -nostdlibinc -isystem "$INC/riscv32-linux-musl"
 "${ZIG[@]}" cc "${CFLAGS[@]}" "-DC4_ARGS=$2" -c "$HERE/c4_qwen.c" -o "$OUT/c4_qwen.o"
 "${ZIG[@]}" cc "${CFLAGS[@]}" -c "$PORT/libc.c" -o "$OUT/libc.o"
 "${ZIG[@]}" cc "${TARGET[@]}" -c "$ENV/crt0.S" -o "$OUT/crt0.o"
-"${ZIG[@]}" cc "${TARGET[@]}" -DC4_SRC="\"$OUT/c4_32.c\"" -DHELLO_SRC="\"$OUT/c4/hello.c\"" \
-  -DFIB_SRC="\"$HERE/fib.c\"" -c "$HERE/disk.S" -o "$OUT/disk.o"
+# (zig caches by the assembler file and flags, not the .incbin files: their hash goes in a flag)
+HASH=$(cat "$OUT/c4_32.c" "$OUT/c4/hello.c" "$HERE"/*.c | shasum | cut -c1-16)
+"${ZIG[@]}" cc "${TARGET[@]}" -DDISK_HASH=$HASH -DC4_SRC="\"$OUT/c4_32.c\"" -DHELLO_SRC="\"$OUT/c4/hello.c\"" \
+  -DFIB_SRC="\"$HERE/fib.c\"" -DMANDEL_SRC="\"$HERE/mandel.c\"" -c "$HERE/disk.S" -o "$OUT/disk.o"
 # libc.c's ROM disk is Doom's; its wad symbols are given empty here
 printf '.section .rodata\n.globl qd_wad, qd_wad_end\nqd_wad:\nqd_wad_end:\n' > "$OUT/nowad.S"
 "${ZIG[@]}" cc "${TARGET[@]}" -c "$OUT/nowad.S" -o "$OUT/nowad.o"

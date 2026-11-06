@@ -4,9 +4,11 @@
 #include <string.h>
 
 typedef struct { const char *name; const char *data, *end; } File;
-extern const char qd_c4[], qd_c4_end[], qd_hello[], qd_hello_end[], qd_fib[], qd_fib_end[];
+extern const char qd_c4[], qd_c4_end[], qd_hello[], qd_hello_end[], qd_fib[], qd_fib_end[],
+    qd_mandel[], qd_mandel_end[];
 static const File disk[] = {
-    {"c4.c", qd_c4, qd_c4_end}, {"hello.c", qd_hello, qd_hello_end}, {"fib.c", qd_fib, qd_fib_end}};
+    {"c4.c", qd_c4, qd_c4_end}, {"hello.c", qd_hello, qd_hello_end}, {"fib.c", qd_fib, qd_fib_end},
+    {"mandel.c", qd_mandel, qd_mandel_end}};
 #define NFILES (int)(sizeof disk / sizeof *disk)
 
 static struct { const File *f; int pos; } fds[8];
