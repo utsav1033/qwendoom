@@ -1,0 +1,70 @@
+--- c4/c4.c	2026-11-06 23:54:52
++++ c4_fast.c	2026-11-07 00:21:59
+@@ -37,7 +37,8 @@
+ // opcodes
+ enum { LEA ,IMM ,JMP ,JSR ,BZ  ,BNZ ,ENT ,ADJ ,LEV ,LI  ,LC  ,SI  ,SC  ,PSH ,
+        OR  ,XOR ,AND ,EQ  ,NE  ,LT  ,GT  ,LE  ,GE  ,SHL ,SHR ,ADD ,SUB ,MUL ,DIV ,MOD ,
+-       OPEN,READ,CLOS,PRTF,MALC,FREE,MSET,MCMP,EXIT };
++       OPEN,READ,CLOS,PRTF,MALC,FREE,MSET,MCMP,EXIT,
++       LL  ,LLC ,PSI ,PLL ,LAP  }; // fused: LEA n LI, LEA n LC, PSH IMM n, PSH LEA n LI, LEA n PSH
+ 
+ // types
+ enum { CHAR, INT, PTR };
+@@ -334,7 +335,7 @@
+ {
+   int fd, bt, ty, poolsz, *idmain;
+   int *pc, *sp, *bp, a, cycle; // vm registers
+-  int i, *t; // temps
++  int i, *t, dbg; // temps
+ 
+   --argc; ++argv;
+   if (argc > 0 && **argv == '-' && (*argv)[1] == 's') { src = 1; --argc; ++argv; }
+@@ -462,6 +463,20 @@
+ 
+   if (!(pc = (int *)idmain[Val])) { printf("main() not defined\n"); return -1; }
+   if (src) return 0;
++
++  // fuse the commonest pairs in place (the code keeps its length, so jumps stay right):
++  // LEA n LI -> LL n (skipping the LI), LEA n LC -> LLC n, PSH IMM n -> PSI n,
++  // PSH LEA n LI -> PLL n, LEA n PSH -> LAP n
++  t = le + 1;
++  while (t <= e) {
++    i = *t;
++    if (i == PSH && t[1] == LEA && t[3] == LI) *t = PLL;
++    else if (i == LEA && t[2] == LI) *t = LL;
++    else if (i == LEA && t[2] == PSH) *t = LAP;
++    else if (i == LEA && t[2] == LC) *t = LLC;
++    else if (i == PSH && t[1] == IMM) *t = PSI;
++    if (i <= ADJ) t = t + 2; else t = t + 1;
++  }
+ 
+   // setup stack
+   bp = sp = (int *)((int)sp + poolsz);
+@@ -472,17 +487,22 @@
+   *--sp = (int)t;
+ 
+   // run...
+-  cycle = 0;
++  cycle = 0; dbg = debug;
+   while (1) {
+     i = *pc++; ++cycle;
+-    if (debug) {
++    if (dbg) {
+       printf("%d> %.4s", cycle,
+         &"LEA ,IMM ,JMP ,JSR ,BZ  ,BNZ ,ENT ,ADJ ,LEV ,LI  ,LC  ,SI  ,SC  ,PSH ,"
+          "OR  ,XOR ,AND ,EQ  ,NE  ,LT  ,GT  ,LE  ,GE  ,SHL ,SHR ,ADD ,SUB ,MUL ,DIV ,MOD ,"
+-         "OPEN,READ,CLOS,PRTF,MALC,FREE,MSET,MCMP,EXIT,"[i * 5]);
+-      if (i <= ADJ) printf(" %d\n", *pc); else printf("\n");
++         "OPEN,READ,CLOS,PRTF,MALC,FREE,MSET,MCMP,EXIT,LL  ,LLC ,PSI ,PLL ,LAP ,"[i * 5]);
++      if (i <= ADJ || i >= LL) printf(" %d\n", i == PSI || i == PLL ? pc[1] : *pc); else printf("\n");
+     }
+-    if      (i == LEA) a = (int)(bp + *pc++);                             // load local address
++    if      (i == LL)  { a = *(bp + *pc); pc = pc + 2; }                // load local int
++    else if (i == PSI) { *--sp = a; a = pc[1]; pc = pc + 2; }           // push, load immediate
++    else if (i == PLL) { *--sp = a; a = *(bp + pc[1]); pc = pc + 3; }   // push, load local int
++    else if (i == LAP) { *--sp = a = (int)(bp + *pc); pc = pc + 2; }    // local address, push
++    else if (i == LLC) { a = *(char *)(bp + *pc); pc = pc + 2; }        // load local char
++    else if (i == LEA) a = (int)(bp + *pc++);                             // load local address
+     else if (i == IMM) a = *pc++;                                         // load global address or immediate
+     else if (i == JMP) pc = (int *)*pc;                                   // jump
+     else if (i == JSR) { *--sp = (int)(pc + 1); pc = (int *)*pc; }        // jump to subroutine

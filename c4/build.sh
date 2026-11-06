@@ -11,7 +11,10 @@ ENV=$HERE/../qwenputer/chipformer/rv/env
 mkdir -p "$OUT"
 if [ ! -d "$OUT/c4" ]; then git clone -q https://github.com/rswier/c4 "$OUT/c4"; fi
 git -C "$OUT/c4" checkout -q "$C4_COMMIT"
-sed 's/^#define int long long$/#define int int/' "$OUT/c4/c4.c" > "$OUT/c4_32.c"
+# c4-fuse.patch: fused VM ops for the commonest op pairs (C4_STOCK=1 leaves c4 as it is)
+cp "$OUT/c4/c4.c" "$OUT/c4_src.c"
+[ -n "${C4_STOCK:-}" ] || patch -s "$OUT/c4_src.c" "$HERE/c4-fuse.patch"
+sed 's/^#define int long long$/#define int int/' "$OUT/c4_src.c" > "$OUT/c4_32.c"
 
 ZIGPKG=$(uv run --no-project --with ziglang python -I -c \
   "import ziglang, os; print(os.path.dirname(ziglang.__file__))")
@@ -24,7 +27,7 @@ CFLAGS=("${TARGET[@]}" -O2 -w -nostdlibinc -isystem "$INC/riscv32-linux-musl"
 
 "${ZIG[@]}" cc "${CFLAGS[@]}" -Dmain=c4_main -c "$OUT/c4_32.c" -o "$OUT/c4.o"
 "${ZIG[@]}" cc "${CFLAGS[@]}" "-DC4_ARGS=$2" -c "$HERE/c4_qwen.c" -o "$OUT/c4_qwen.o"
-"${ZIG[@]}" cc "${CFLAGS[@]}" -c "$PORT/libc.c" -o "$OUT/libc.o"
+"${ZIG[@]}" cc "${CFLAGS[@]}" -Dmemset=libc_memset -c "$PORT/libc.c" -o "$OUT/libc.o"
 "${ZIG[@]}" cc "${TARGET[@]}" -c "$ENV/crt0.S" -o "$OUT/crt0.o"
 # (zig caches by the assembler file and flags, not the .incbin files: their hash goes in a flag)
 HASH=$(cat "$OUT/c4_32.c" "$OUT/c4/hello.c" "$HERE"/*.c | shasum | cut -c1-16)

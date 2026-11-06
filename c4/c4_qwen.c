@@ -35,6 +35,17 @@ int close(int fd) {
     return 0;
 }
 
+// c4 zeroes 768 KB at start (its own memset calls, and every c4 it runs): eight words a loop.
+// (port/libc.c's memset is built as libc_memset here, so Doom's build stays as it is.)
+void *libc_memset(void *d, int c, size_t n);
+void *memset(void *d, int c, size_t n) {
+    if (((size_t)d | n) & 3) return libc_memset(d, c, n);
+    unsigned w = (unsigned char)c * 0x01010101u, *p = d, *end = p + (n >> 2);
+    for (; end - p >= 8; p += 8) p[0] = p[1] = p[2] = p[3] = p[4] = p[5] = p[6] = p[7] = w;
+    while (p < end) *p++ = w;
+    return d;
+}
+
 int c4_main(int argc, char **argv);
 #ifndef C4_ARGS
 #define C4_ARGS "c4", "hello.c"
