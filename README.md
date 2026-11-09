@@ -8,7 +8,10 @@ that memory once, before the first token. After that, its only job is to compute
 token at a time and feed each token back in: it never runs a Doom instruction or touches Doom's
 memory again.
 
-![Doom on the model: its first frames, then the game playing in the emulator](docs/img/hero.gif)
+<p>
+  <img src="doom.jpeg" height="420" alt="Doom">
+  <img src="docs/img/hero.gif" height="420" alt="Doom on the model: its first frames, then the game playing in the emulator">
+</p>
 
 *First 4 seconds: frames drawn by the model, read out of its own memory, with its real token
 counts and run time. Then the game playing in the emulator (same machine, labelled), with the
