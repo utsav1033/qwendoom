@@ -9,8 +9,9 @@ token at a time and feed each token back in: it never runs a Doom instruction or
 memory again.
 
 <p>
-  <img src="doom.jpeg" height="420" alt="Doom">
-  <img src="docs/img/hero.gif" height="420" alt="Doom on the model: its first frames, then the game playing in the emulator">
+  <img src="doom.jpeg" width="45%" alt="Doom">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/img/hero.gif" width="45%" alt="Doom on the model: its first frames, then the game playing in the emulator">
 </p>
 
 *First 4 seconds: frames drawn by the model, read out of its own memory, with its real token

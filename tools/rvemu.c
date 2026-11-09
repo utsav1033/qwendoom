@@ -7,7 +7,7 @@
 // machine's memory as the host will read it from the model's state.
 //
 //   rvemu doom.elf [-frames N] [-shot K out.ppm] [-vbuf ADDR -pal ADDR] [-q] [-stop N]
-//                  [-touch out.bin]
+//                  [-touch out.bin] [-dump out.bin EVERY] [-pcs out.bin EVERY]
 //
 // prints the program's output (FRAME_MARK bytes left out), then the instruction count at every
 // frame (-q: only the totals). -stop N: after N instructions, the PC, registers and a RAM hash.
@@ -41,6 +41,20 @@ static void touch_write(void) {
     FILE *f = touch_path ? fopen(touch_path, "wb") : NULL;
     if (!f) return;
     fwrite(ram_t, 1, sizeof ram_t, f), fwrite(drom_t, 1, sizeof drom_t, f), fclose(f);
+}
+
+// -dump: the whole RAM every EVERY instructions and after each frame, as records of a 112-byte
+// header (instructions so far, frames done, 1 after a frame else 0, the output line so far) then
+// RAM_SIZE bytes
+static FILE *dump_f, *pcs_f;  // -pcs: (instructions so far, pc, instruction word) every EVERY
+static uint64_t dump_every, pcs_every;
+static char line[96];
+static int line_n;
+static void dump(uint64_t ic, int32_t frames_done, int32_t kind) {
+    if (!dump_f) return;
+    uint64_t h0 = ic;
+    fwrite(&h0, 8, 1, dump_f), fwrite(&frames_done, 4, 1, dump_f), fwrite(&kind, 4, 1, dump_f);
+    fwrite(line, 1, sizeof line, dump_f), fwrite(ram, 1, RAM_SIZE, dump_f);
 }
 
 static uint8_t *mem(uint32_t a, int n, int store) {
@@ -103,6 +117,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-q")) quiet = 1;
         else if (!strcmp(argv[i], "-stop")) stop = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-touch")) touch_path = argv[++i];
+        else if (!strcmp(argv[i], "-pcs")) pcs_f = fopen(argv[i + 1], "wb"), pcs_every = strtoull(argv[i + 2], NULL, 0), i += 2;
+        else if (!strcmp(argv[i], "-dump")) dump_f = fopen(argv[i + 1], "wb"), dump_every = strtoull(argv[i + 2], NULL, 0), i += 2;
     }
     atexit(touch_write);
     load_elf(argv[1]);
@@ -121,6 +137,11 @@ int main(int argc, char **argv) {
         if (pc < ROM_BASE || pc >= ROM_BASE + ROM_SIZE || pc & 3) fault("bad jump", pc);
         uint32_t w;
         memcpy(&w, rom + (pc - ROM_BASE), 4);
+        if (dump_every && icount % dump_every == 0) dump(icount, (int32_t)frame, 0);
+        if (pcs_every && icount % pcs_every == 0) {
+            uint64_t ic = icount;
+            fwrite(&ic, 8, 1, pcs_f), fwrite(&pc, 4, 1, pcs_f), fwrite(&w, 4, 1, pcs_f);
+        }
         icount++;
         uint32_t op = w & 0x7f, rd = w >> 7 & 31, f3 = w >> 12 & 7, rs1 = w >> 15 & 31,
                  rs2 = w >> 20 & 31, f7 = w >> 25;
@@ -214,9 +235,16 @@ int main(int argc, char **argv) {
             }
             if (x[17] != 1) fault("ecall", x[17]);
             if ((x[10] & 255) != FRAME_MARK) {
-                putchar(x[10] & 255);
+                int ch = x[10] & 255;
+                putchar(ch);
+                if (ch == '\n') { if (line_n) line_n = -line_n; }  // (a finished line stays until the next starts)
+                else {
+                    if (line_n < 0) line_n = 0, memset(line, 0, sizeof line);
+                    if (line_n < (int)sizeof line - 1) line[line_n++] = (char)ch;
+                }
                 break;
             }
+            dump(icount, (int32_t)frame + 1, 1);
             if (!quiet) printf("[frame %ld: %llu instructions]\n", frame, (unsigned long long)(icount - last));
             last = icount;
             if (frame == shot && vbuf && pal) {
